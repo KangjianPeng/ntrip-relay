@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import pynmea2
 import serial
 
-import ntrip_um960_relay as relay
+import ntrip_relay as relay
 from tests.test_gga import NO_FIX, POSITION, FakeSerial, FakeSocket
 
 
@@ -25,7 +25,7 @@ def position_at(timestamp):
 def arguments():
     return SimpleNamespace(
         host="localhost",
-        caster_port=8002,
+        caster_port=2101,
         mount="TEST",
         connect_timeout=2,
         serial="/dev/fake",

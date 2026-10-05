@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pynmea2
 
-from ntrip_um960_relay import GgaReader, RelayError, parse_gga, relay_session
+from ntrip_relay import GgaReader, RelayError, parse_gga, relay_session
 
 NO_FIX = b"$GNGGA,,,,,,0,,,,,,,,*78\r\n"
 # Synthetic fixtures exercise the parser; production data comes only from UART.
@@ -142,9 +142,9 @@ class GgaReaderTests(unittest.TestCase):
         self.assertEqual(self.reader.latest, POSITION)
 
     def test_expired_position_is_not_fresh(self):
-        with patch("ntrip_um960_relay.time.monotonic", return_value=100):
+        with patch("ntrip_relay.time.monotonic", return_value=100):
             self.feed(POSITION)
-        with patch("ntrip_um960_relay.time.monotonic", return_value=116):
+        with patch("ntrip_relay.time.monotonic", return_value=116):
             self.assertFalse(self.reader.is_fresh())
 
 
@@ -173,7 +173,7 @@ class RelayPositionTests(unittest.TestCase):
         self.reader = GgaReader(self.port, stale_after=15)
         self.args = SimpleNamespace(
             host="localhost",
-            caster_port=8002,
+            caster_port=2101,
             mount="TEST",
             connect_timeout=2,
             gga_interval=5,
@@ -183,7 +183,7 @@ class RelayPositionTests(unittest.TestCase):
     def test_no_connection_while_only_no_fix_data_is_received(self):
         self.port.buffer.extend(NO_FIX)
         self.reader.poll()
-        with patch("ntrip_um960_relay.connect_mount") as connect:
+        with patch("ntrip_relay.connect_mount") as connect:
             with patch.object(self.reader._stop, "wait", side_effect=KeyboardInterrupt):
                 with self.assertRaises(KeyboardInterrupt):
                     relay_session(self.args, self.port, "user", "password", self.reader)
@@ -200,7 +200,7 @@ class RelayPositionTests(unittest.TestCase):
             self.reader.poll()
             return sock, b"corrections already received"
 
-        with patch("ntrip_um960_relay.connect_mount", side_effect=connect):
+        with patch("ntrip_relay.connect_mount", side_effect=connect):
             with self.assertRaises(RelayError):
                 relay_session(self.args, self.port, "user", "password", self.reader)
         self.assertEqual(sock.sent, [])
@@ -217,7 +217,7 @@ class RelayPositionTests(unittest.TestCase):
             return b"corrections"
 
         sock = FakeSocket(receive)
-        with patch("ntrip_um960_relay.connect_mount", return_value=(sock, b"")):
+        with patch("ntrip_relay.connect_mount", return_value=(sock, b"")):
             with self.assertRaises(RelayError):
                 relay_session(self.args, self.port, "user", "password", self.reader)
         self.assertEqual(sock.sent, [POSITION])
@@ -230,7 +230,7 @@ class RelayPositionTests(unittest.TestCase):
         payload = b"\xd3\x00\x01\x00\xff\x80\x00"
         chunks = iter((payload, b""))
         sock = FakeSocket(lambda count: next(chunks))
-        with patch("ntrip_um960_relay.connect_mount", return_value=(sock, b"")):
+        with patch("ntrip_relay.connect_mount", return_value=(sock, b"")):
             with self.assertRaises(RelayError):
                 relay_session(self.args, self.port, "user", "password", self.reader)
         self.assertEqual(sock.sent, [POSITION])

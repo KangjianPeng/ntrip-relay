@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Forward NTRIP RTCM corrections to a UM960 UART through a USB-serial adapter."""
+"""Forward NTRIP RTCM corrections to a GNSS receiver through a serial adapter."""
 
 from __future__ import annotations
 
@@ -16,11 +16,14 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import time as utc_time
+from pathlib import Path
 
 import pynmea2
 import serial
+from dotenv import load_dotenv
 
-LOG = logging.getLogger("ntrip_um960_relay")
+LOG = logging.getLogger("ntrip_relay")
+DEFAULT_ENV_FILE = Path(__file__).resolve().with_name(".env")
 
 
 class RelayError(RuntimeError):
@@ -158,7 +161,7 @@ class GgaReader:
 
     def __enter__(self):
         self._discard_backlog()
-        self._thread = threading.Thread(target=self._run, name="um960-gga", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="gnss-gga", daemon=True)
         self._thread.start()
         return self
 
@@ -194,7 +197,7 @@ class GgaReader:
         except (OSError, serial.SerialException, SerialLinkError) as exc:
             with self._lock:
                 self.latest = None
-                self._error = SerialLinkError(f"UM960 串口读取失败：{exc}")
+                self._error = SerialLinkError(f"接收机串口读取失败：{exc}")
 
     def _record(self, gga: GgaData, now: float) -> bool:
         # A repeated UTC epoch must not renew freshness, even if UART keeps sending it.
@@ -265,17 +268,17 @@ class GgaReader:
                 self.buffer.clear()
 
     def _log_position(self, gga: GgaData) -> None:
-        LOG.debug("UM960 原始 GGA：%s", gga.sentence.decode("ascii").strip())
+        LOG.debug("接收机原始 GGA：%s", gga.sentence.decode("ascii").strip())
         if not gga.has_position:
             LOG.warning(
-                "UM960 GGA：%s（quality=%d），卫星数=%s；无可用实测坐标，等待定位",
+                "接收机 GGA：%s（quality=%d），卫星数=%s；无可用实测坐标，等待定位",
                 FIX_NAMES[gga.quality],
                 gga.quality,
                 gga.satellites if gga.satellites is not None else "未知",
             )
             return
         LOG.info(
-            "UM960 GGA：%s；纬度=%.8f，经度=%.8f，卫星数=%s，HDOP=%s，海拔=%s m，UTC=%s",
+            "接收机 GGA：%s；纬度=%.8f，经度=%.8f，卫星数=%s，HDOP=%s，海拔=%s m，UTC=%s",
             FIX_NAMES[gga.quality],
             gga.latitude,
             gga.longitude,
@@ -307,7 +310,7 @@ class GgaReader:
                 return gga
             now = time.monotonic()
             if now - last_notice >= 5:
-                LOG.info("等待 UM960 的真实有效 GGA；单点定位即可请求 RTCM")
+                LOG.info("等待接收机的真实有效 GGA；单点定位即可请求 RTCM")
                 last_notice = now
             self._stop.wait(0.1)
 
@@ -343,7 +346,7 @@ def _read_ntrip_response(
     deadline = time.monotonic() + (timeout if timeout is not None else 10.0)
     try:
         while True:
-            # This caster also returns short errors without a complete HTTP header.
+            # Some casters return short errors without a complete HTTP header.
             status = bytes(response).split(b"\r\n", 1)[0]
             code = _check_ntrip_status(status)
             if b"\r\n\r\n" in response:
@@ -376,7 +379,7 @@ def connect_mount(
     request = (
         f"GET /{mount} HTTP/1.0\r\n"
         f"Host: {host}:{port}\r\n"
-        "User-Agent: NTRIP UM960Relay/1.0\r\n"
+        "User-Agent: NTRIP NtripRelay/1.0\r\n"
         "Ntrip-Version: Ntrip/2.0\r\n"
         "Accept: */*\r\n"
         f"Authorization: Basic {token}\r\n"
@@ -398,9 +401,9 @@ def write_all(serial_port, data: bytes) -> None:
         try:
             count = serial_port.write(data[offset:])
         except (OSError, serial.SerialException) as exc:
-            raise SerialLinkError(f"UM960 串口写入失败：{exc}") from exc
+            raise SerialLinkError(f"接收机串口写入失败：{exc}") from exc
         if not count:
-            raise SerialLinkError("UM960 串口写入超时")
+            raise SerialLinkError("接收机串口写入超时")
         offset += count
 
 
@@ -424,7 +427,7 @@ def relay_session(
     with sock:
         gga = gga_reader.get_latest()
         if gga is None:
-            raise RelayError("UM960 无有效实时位置，暂停转发并等待新定位")
+            raise RelayError("接收机无有效实时位置，暂停转发并等待新定位")
         sock.sendall(gga)
         last_gga_sent = time.monotonic()
         rtcm_wait_started_at = last_gga_sent
@@ -451,7 +454,7 @@ def relay_session(
             now = time.monotonic()
             gga = gga_reader.get_latest()
             if gga is None:
-                raise RelayError("UM960 未定位或 GGA 已超时，暂停转发并等待新定位")
+                raise RelayError("接收机未定位或 GGA 已超时，暂停转发并等待新定位")
             since = last_rtcm_at if last_rtcm_at is not None else rtcm_wait_started_at
             if now - since >= args.rtcm_timeout:
                 detail = (
@@ -475,7 +478,7 @@ def relay_session(
 
             if data:
                 if gga_reader.get_latest() is None:
-                    raise RelayError("UM960 未定位或 GGA 已超时，暂停转发并等待新定位")
+                    raise RelayError("接收机未定位或 GGA 已超时，暂停转发并等待新定位")
                 write_all(serial_port, data)
                 total_bytes += len(data)
                 last_rtcm_at = time.monotonic()
@@ -513,7 +516,7 @@ def run_relay(args, username: str, password: str) -> int:
                 dsrdtr=False,
             ) as serial_port:
                 LOG.info("串口已打开：%s @ %d baud", args.serial, args.baud)
-                LOG.info("GGA 来源：UM960 串口实时 NMEA 输出")
+                LOG.info("GGA 来源：接收机串口实时 NMEA 输出")
                 with GgaReader(serial_port, args.gga_timeout) as gga_reader:
                     while True:
                         try:
@@ -541,33 +544,57 @@ def run_relay(args, username: str, password: str) -> int:
 
 
 def parse_args(argv=None):
+    env_parser = argparse.ArgumentParser(add_help=False)
+    env_parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=DEFAULT_ENV_FILE,
+        help="配置文件路径，默认读取脚本所在目录的 .env",
+    )
+    env_args, _ = env_parser.parse_known_args(argv)
+    load_dotenv(env_args.env_file, override=False)
+
     parser = argparse.ArgumentParser(
-        description="通过 CH340 USB-TTL 将 NTRIP RTCM 数据转发到 UM960。"
+        description="通过串口将 NTRIP RTCM 差分数据转发到 GNSS 接收机。",
+        parents=[env_parser],
+    )
+    serial_device = os.getenv("SERIAL_DEVICE") or None
+    parser.add_argument(
+        "--serial",
+        default=serial_device,
+        required=serial_device is None,
+        help="接收机串口，也可用 SERIAL_DEVICE 提供",
     )
     parser.add_argument(
-        "--serial", required=True, help="CH340 串口，如 /dev/ttyUSB0 或 COM3"
+        "--baud",
+        type=int,
+        default=os.getenv("SERIAL_BAUD", "115200"),
+        help="接收机串口波特率，也可用 SERIAL_BAUD；默认 115200",
     )
+    host = os.getenv("NTRIP_HOST") or None
     parser.add_argument(
-        "--baud", type=int, default=115200, help="UM960 串口波特率，默认 115200"
+        "--host",
+        default=host,
+        required=host is None,
+        help="NTRIP 服务域名或 IP，也可用 NTRIP_HOST 提供",
     )
-    parser.add_argument("--host", default="rtkcq.cn", help="NTRIP 服务域名")
     parser.add_argument(
         "--caster-port",
         type=int,
-        default=8002,
-        choices=(8001, 8002, 8003),
-        help="8001 ITRF2008；8002 WGS84；8003 CGCS2000",
+        default=os.getenv("NTRIP_PORT", "2101"),
+        help="NTRIP TCP 端口，也可用 NTRIP_PORT；默认 2101",
     )
+    mount = os.getenv("NTRIP_MOUNT") or None
     parser.add_argument(
         "--mount",
-        default="RTCM33_GRCEJ",
-        choices=("RTCM33_GRC", "RTCM33_GRCEJ"),
-        help="RTCM 挂载点",
+        default=mount,
+        required=mount is None,
+        help="服务商提供的 RTCM 挂载点，也可用 NTRIP_MOUNT 提供",
     )
     parser.add_argument(
         "--username",
         default=os.getenv("NTRIP_USER"),
-        help="NTRIP 卡号，也可用 NTRIP_USER",
+        help="NTRIP 账号，也可用 NTRIP_USER",
     )
     parser.add_argument(
         "--gga-interval", type=float, default=5.0, help="向服务端发送 GGA 的间隔秒数"
@@ -590,7 +617,19 @@ def parse_args(argv=None):
     parser.add_argument(
         "--verbose", action="store_true", help="显示调试日志和串口原始 GGA"
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not 1 <= args.caster_port <= 65535:
+        parser.error("NTRIP_PORT / --caster-port 必须在 1 到 65535 之间")
+    args.mount = args.mount.lstrip("/")
+    for name, value in (
+        ("NTRIP_HOST / --host", args.host),
+        ("NTRIP_MOUNT / --mount", args.mount),
+    ):
+        if re.fullmatch(r"[!-~]+", value) is None:
+            parser.error(f"{name} 必须为非空可打印 ASCII 字符串，且不能包含空白")
+    if args.baud <= 0:
+        parser.error("SERIAL_BAUD / --baud 必须大于 0")
+    return args
 
 
 def main(argv=None) -> int:
@@ -612,10 +651,10 @@ def main(argv=None) -> int:
         logging.error("时间参数必须为有限且大于 0 的数值")
         return 2
 
-    username = args.username or input("NTRIP 卡号: ").strip()
+    username = args.username or input("NTRIP 账号: ").strip()
     password = os.getenv("NTRIP_PASSWORD") or getpass.getpass("NTRIP 密码: ")
     if not username or not password:
-        logging.error("NTRIP 卡号和密码不能为空")
+        logging.error("NTRIP 账号和密码不能为空")
         return 2
 
     try:
