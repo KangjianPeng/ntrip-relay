@@ -16,6 +16,21 @@
 - 接收机需要连接 GNSS 天线，并获得真实定位。单点定位即可开始请求差分，无需预先取得 RTK FIX。
 - Linux 可用 `ls -l /dev/serial/by-id/` 查找设备，长期运行建议使用稳定的 `by-id` 或 `by-path` 路径。Windows 可使用 `COM3` 等名称。
 
+Linux 下运行节点的用户必须有串口设备的读写权限。先检查设备属组和当前用户组：
+
+```bash
+ls -l /dev/ttyUSB0
+id -nG
+```
+
+常见发行版将串口设备分配给 `dialout` 组，可将当前用户加入该组：
+
+```bash
+sudo usermod -aG dialout "$USER"
+```
+
+然后注销并重新登录，再启动节点。其他发行版可能使用 `uucp` 等设备属组，请以 `ls -l` 显示的属组为准。重新连接设备后权限可能由系统规则重设；不要依赖手动修改设备节点权限。
+
 ## ROS 2 安装与运行
 
 需要已安装的 ROS 2、`colcon`、`rosdep`、`uv`、可访问 CORS 服务商的网络，以及串口读写权限。
@@ -79,8 +94,6 @@ ros2 run ntrip_gnss_relay ntrip_gnss_relay \
 | `--rtcm-timeout` | — | `15` 秒 |
 | `--verbose` | — | 关闭 |
 
-Linux 原生后台部署与服务管理见 [DEPLOYMENT.md](DEPLOYMENT.md)。
-
 ## ROS 2 话题
 
 节点将校验通过的原始 GGA 发布为 `nmea_msgs/msg/Sentence`，默认话题为 `/gnss/gga`。有效的未定位报文（`quality=0`）也会发布；校验错误或非 GGA 报文不会发布。`sentence` 保留接收机报文及校验和，不包含串口行尾；`header.stamp` 使用本机收到报文时的 ROS 时间。
@@ -136,7 +149,6 @@ $GNGGA,,,,,,0,,,,,,,,*78
 ntrip_gnss_relay.py              GGA 解析、ROS 2 发布、NTRIP 转发与恢复
 CMakeLists.txt / package.xml    ROS 2 包构建和运行依赖
 .env.example               不含凭据的配置模板
-deploy/ntrip-relay.service  Linux systemd 部署示例
 pyproject.toml / uv.lock    Python 依赖和锁定版本
 tests/test_config.py       配置优先级、通用端口和挂载点验证
 tests/test_gga.py          GGA 与定位状态验证
