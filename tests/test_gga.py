@@ -121,6 +121,14 @@ class GgaReaderTests(unittest.TestCase):
         self.assertEqual(self.reader.latest, POSITION)
         self.assertTrue(self.reader.is_fresh())
 
+    def test_callback_receives_checked_gga_sentences_including_no_fix(self):
+        received = []
+        self.reader = GgaReader(self.port, stale_after=15, on_gga=received.append)
+        self.feed(NO_FIX)
+        self.feed(POSITION)
+        self.feed(NO_FIX.replace(b"*78", b"*00"))
+        self.assertEqual([gga.sentence for gga in received], [NO_FIX, POSITION])
+
     def test_no_fix_immediately_clears_previous_position_and_can_recover(self):
         self.feed(POSITION)
         self.assertTrue(self.reader.is_fresh())

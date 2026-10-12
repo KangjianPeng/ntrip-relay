@@ -141,7 +141,12 @@ def parse_gga(value: str | bytes) -> GgaData | None:
 class GgaReader:
     """Continuously retain the latest checked GGA and propagate UART faults."""
 
-    def __init__(self, serial_port, stale_after: float):
+    def __init__(
+        self,
+        serial_port,
+        stale_after: float,
+        on_gga: Callable[[GgaData], None] | None = None,
+    ):
         self.serial_port = serial_port
         self.stale_after = stale_after
         self.buffer = bytearray()
@@ -155,6 +160,8 @@ class GgaReader:
         self._error: SerialLinkError | None = None
         self._last_utc_seconds: float | None = None
         self._epoch_changed_at: float | None = None
+        self.on_gga = on_gga
+        self._last_callback_error: float | None = None
 
     def __enter__(self):
         self._discard_backlog()
@@ -239,6 +246,17 @@ class GgaReader:
             if gga.has_position and not usable:
                 LOG.warning("GGA 定位历元未推进或已过期，暂停使用该位置")
             self.last_status_report = now
+        if self.on_gga is not None:
+            try:
+                self.on_gga(gga)
+                self._last_callback_error = None
+            except Exception:
+                if (
+                    self._last_callback_error is None
+                    or now - self._last_callback_error >= 5
+                ):
+                    LOG.exception("发布 UM960 GGA 数据失败")
+                    self._last_callback_error = now
         return usable
 
     def poll(self) -> None:
@@ -310,6 +328,55 @@ class GgaReader:
                 LOG.info("等待 UM960 的真实有效 GGA；单点定位即可请求 RTCM")
                 last_notice = now
             self._stop.wait(0.1)
+
+
+class Ros2GgaPublisher:
+    """Publish checked receiver sentences as nmea_msgs/msg/Sentence."""
+
+    topic = "/gnss/gga"
+
+    def __init__(self, ros_args: list[str]):
+        try:
+            import rclpy
+            from nmea_msgs.msg import Sentence
+            from rclpy.executors import SingleThreadedExecutor
+            from rclpy.node import Node
+            from rclpy.qos import qos_profile_sensor_data
+            from rclpy.signals import SignalHandlerOptions
+        except ImportError as exc:
+            raise RuntimeError("需要先安装并加载 ROS 2、rclpy 和 nmea_msgs") from exc
+
+        self.rclpy = rclpy
+        self.Sentence = Sentence
+        self.owns_context = not rclpy.ok()
+        if self.owns_context:
+            rclpy.init(
+                args=ros_args,
+                signal_handler_options=SignalHandlerOptions.NO,
+            )
+        self.node = Node("um960_ntrip_relay")
+        self.publisher = self.node.create_publisher(
+            Sentence, self.topic, qos_profile_sensor_data
+        )
+        self.executor = SingleThreadedExecutor()
+        self.executor.add_node(self.node)
+        self._thread = threading.Thread(
+            target=self.executor.spin, name="ros2-gga", daemon=True
+        )
+        self._thread.start()
+
+    def publish(self, gga: GgaData) -> None:
+        message = self.Sentence()
+        message.header.stamp = self.node.get_clock().now().to_msg()
+        message.sentence = gga.sentence.decode("ascii").rstrip("\r\n")
+        self.publisher.publish(message)
+
+    def close(self) -> None:
+        self.executor.shutdown()
+        self._thread.join()
+        self.node.destroy_node()
+        if self.owns_context and self.rclpy.ok():
+            self.rclpy.shutdown()
 
 
 def _check_ntrip_status(status: bytes) -> int | None:
@@ -492,7 +559,12 @@ def relay_session(
                 last_report = now
 
 
-def run_relay(args, username: str, password: str) -> int:
+def run_relay(
+    args,
+    username: str,
+    password: str,
+    on_gga: Callable[[GgaData], None] | None = None,
+) -> int:
     """Keep reading through network retries; reopen the UART after serial faults."""
 
     network_backoff = RetryBackoff()
@@ -514,7 +586,9 @@ def run_relay(args, username: str, password: str) -> int:
             ) as serial_port:
                 LOG.info("串口已打开：%s @ %d baud", args.serial, args.baud)
                 LOG.info("GGA 来源：UM960 串口实时 NMEA 输出")
-                with GgaReader(serial_port, args.gga_timeout) as gga_reader:
+                with GgaReader(
+                    serial_port, args.gga_timeout, on_gga=on_gga
+                ) as gga_reader:
                     while True:
                         try:
                             relay_session(
@@ -590,7 +664,9 @@ def parse_args(argv=None):
     parser.add_argument(
         "--verbose", action="store_true", help="显示调试日志和串口原始 GGA"
     )
-    return parser.parse_args(argv)
+    args, ros_args = parser.parse_known_args(argv)
+    args.ros_args = ros_args
+    return args
 
 
 def main(argv=None) -> int:
@@ -619,10 +695,23 @@ def main(argv=None) -> int:
         return 2
 
     try:
-        return run_relay(args, username, password)
+        ros_publisher = Ros2GgaPublisher(args.ros_args)
+    except (ImportError, RuntimeError) as exc:
+        LOG.error("无法启动 ROS 2 GGA 发布：%s", exc)
+        return 2
+
+    try:
+        return run_relay(
+            args,
+            username,
+            password,
+            on_gga=ros_publisher.publish,
+        )
     except KeyboardInterrupt:
         LOG.info("已停止")
         return 0
+    finally:
+        ros_publisher.close()
 
 
 if __name__ == "__main__":

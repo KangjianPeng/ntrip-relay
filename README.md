@@ -5,7 +5,9 @@
 数据路径如下：
 
 ```text
-UM960 TX (GGA) -> CH340 RX -> Python/NTRIP -> CH340 TX (RTCM) -> UM960 RX
+                         +-> ROS 2 /gnss/gga
+UM960 TX (GGA) -> CH340 RX
+                         +-> NTRIP -> CH340 TX (RTCM) -> UM960 RX
 ```
 
 脚本只使用接收机实际输出的 GGA；不会生成测试坐标，也不会修改 RTCM 二进制内容。
@@ -29,21 +31,37 @@ UM960 TX (GGA) -> CH340 RX -> Python/NTRIP -> CH340 TX (RTCM) -> UM960 RX
 
 ## 安装和运行
 
-需要 Python 3.10 或更高版本、已安装的 `uv`、可访问 NTRIP 服务的网络，以及具有串口读写权限的运行用户。Linux 上通常使用 `/dev/ttyUSB*`，Windows 可使用 `COM3` 等名称。接收机需要连接 GNSS 天线并获得单点定位。
+需要已安装的 ROS 2、`colcon`、`rosdep`，可访问 NTRIP 服务的网络，以及具有串口读写权限的运行用户。接收机需要连接 GNSS 天线并获得单点定位。
+
+本项目是 `ament_cmake` ROS 2 包，CMake 会将 Python 脚本安装为 ROS 可执行程序。虚拟环境使用系统 Python 并启用系统 site-packages，以便加载 ROS 2 的 `rclpy`；`uv sync` 安装项目锁定的 Python 依赖。
+
+将本项目放在 ROS 2 工作区的 `src` 目录下，加载 ROS 环境并安装依赖：
 
 ```bash
+source /opt/ros/$ROS_DISTRO/setup.bash
+mkdir -p ~/ros2_ws/src
+cd ~/ros2_ws/src
 git clone https://github.com/KangjianPeng/ntrip-relay.git
 cd ntrip-relay
+uv venv --system-site-packages --python /usr/bin/python3
 uv sync --locked
-uv run python ntrip_um960_relay.py \
+cd ~/ros2_ws
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --packages-select ntrip_um960_relay
+source install/setup.bash
+source src/ntrip-relay/.venv/bin/activate
+```
+
+启动 ROS 2 节点：
+
+```bash
+ros2 run ntrip_um960_relay ntrip_um960_relay \
   --serial /dev/ttyUSB0 \
   --baud 115200 \
   --caster-port 8002 \
   --mount RTCM33_GRCEJ \
   --username '你的卡号'
 ```
-
-`uv sync` 会根据 `pyproject.toml` 和 `uv.lock` 创建项目环境并安装 `pyserial`（串口通信）和 `pynmea2`（NMEA 解析）。
 
 运行时按提示输入密码。默认连接 `rtkcq.cn`；端口 `8001` 为 ITRF2008，`8002` 为 WGS84（参考历元 2005），`8003` 为 CGCS2000（参考历元 2000）。挂载点可选 `RTCM33_GRC` 或 `RTCM33_GRCEJ`。
 
@@ -52,10 +70,29 @@ uv run python ntrip_um960_relay.py \
 ```bash
 export NTRIP_USER='你的卡号'
 export NTRIP_PASSWORD='你的密码'
-uv run python ntrip_um960_relay.py --serial /dev/serial/by-id/你的CH340 --baud 115200
+ros2 run ntrip_um960_relay ntrip_um960_relay \
+  --serial /dev/serial/by-id/你的CH340 --baud 115200
 ```
 
 密码会以 Basic Authentication 发送到服务端；当前服务端口是明文 TCP，不要在不可信网络中暴露凭据。
+
+## ROS 2 话题
+
+节点将校验通过的 UM960 GGA 原句发布为 `nmea_msgs/msg/Sentence`，话题固定为 `/gnss/gga`。有效的无定位报文（`quality=0`）也会发布；损坏校验和及非 GGA 报文不会发布。`sentence` 字段保留接收机内容和校验和，不包含串口行尾；`header.stamp` 表示本机收到报文的 ROS 时间，因为 GGA 本身不包含日期。
+
+查看发布数据：
+
+```bash
+ros2 topic echo /gnss/gga nmea_msgs/msg/Sentence
+```
+
+如需重映射，可通过 ROS 标准参数传入：
+
+```bash
+ros2 run ntrip_um960_relay ntrip_um960_relay \
+  --serial /dev/ttyUSB0 --username '你的卡号' \
+  --ros-args -r /gnss/gga:=/robot/gnss/gga
+```
 
 脚本只使用 UM960 实际输出的 GGA，严格验证接收机报文的校验和，并解析 UTC、经纬度、定位质量、卫星数、HDOP 和海拔。日志中的经纬度转换为十进制度；发给服务器的仍是接收机原始 GGA，仅统一行尾为 CRLF。脚本不会生成或补填坐标，已移除固定位置的 `--gga` 参数。
 
@@ -119,14 +156,17 @@ $GNGGA,,,,,,0,,,,,,,,*78
 
 ```bash
 ls -l /dev/serial/by-id/
-uv run python ntrip_um960_relay.py --help
+ros2 run ntrip_um960_relay ntrip_um960_relay --help
 ```
 
 ## 项目结构与测试
 
 ```text
-ntrip_um960_relay.py   GGA 解析、NTRIP 连接、串口转发与恢复逻辑
-pyproject.toml        Python 版本和运行依赖
+ntrip_um960_relay.py   GGA 解析、ROS 2 发布、NTRIP 连接、串口转发与恢复逻辑
+CMakeLists.txt        colcon/ament_cmake 安装入口
+package.xml           ROS 2 包名和 ROS 运行依赖
+LICENSE               MIT 许可证
+pyproject.toml        Python 版本和 uv 运行依赖
 uv.lock               锁定依赖版本
 tests/test_gga.py     定位报文与有效位置转发测试
 tests/test_recovery.py 断线恢复、协议响应、TCP/伪终端集成测试
