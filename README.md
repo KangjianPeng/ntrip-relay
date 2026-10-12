@@ -1,41 +1,24 @@
-# GNSS NTRIP RTCM Relay
+# GNSS NTRIP Relay
 
-这个项目从 GNSS 接收机读取 NMEA GGA，通过 NTRIP 上报给 CORS 服务商，再将服务返回的 RTCM 3.x 差分数据通过 USB-TTL 写回接收机。它适用于没有蜂窝网络 NTRIP 客户端的设备：运行脚本的计算机负责网络连接，接收机负责 GNSS/RTK 解算。文档中的串口配置以 UM960 为例。
-
-数据路径如下：
+将 GNSS 接收机实际输出的 NMEA GGA 通过 NTRIP 上报给 CORS 服务商，再把服务返回的 RTCM 数据通过串口写回接收机。适用于能够输出 GGA 并接收 RTCM 的 GNSS 接收机和提供兼容 NTRIP 数据流的服务；接收机型号、串口适配器、服务域名、端口和挂载点均由使用者选择。
 
 ```text
-                         +-> ROS 2 /gnss/gga
-GNSS TX (GGA) -> USB-TTL RX
-                         +-> NTRIP -> USB-TTL TX (RTCM) -> GNSS RX
+接收机 TX (GGA) -> 串口适配器 RX -> NTRIP
+                    +-> ROS 2 /gnss/gga
+接收机 RX (RTCM) <- 串口适配器 TX <- NTRIP
 ```
 
-脚本只使用接收机实际输出的 GGA；不会生成测试坐标，也不会修改 RTCM 二进制内容。
+## 接收机与接线
 
-## 接线与接收机设置（以 UM960 为例）
+- 接收机 UART TX 接串口适配器 RX，接收机 UART RX 接适配器 TX，GND 共地。
+- 按接收机手册配置同一 UART 输出带校验和的 NMEA GGA，并接受服务返回的 RTCM 消息。脚本不会发送厂商专用配置命令。
+- 接收机与脚本波特率一致；适配器的电平必须兼容接收机 UART，不能直接混接 TTL 与 RS-232。
+- 接收机需要连接 GNSS 天线，并获得真实定位。单点定位即可开始请求差分，无需预先取得 RTK FIX。
+- Linux 可用 `ls -l /dev/serial/by-id/` 查找设备，长期运行建议使用稳定的 `by-id` 或 `by-path` 路径。Windows 可使用 `COM3` 等名称。
 
-- CH340 TXD 接 UM960 UART RX，CH340 RXD 接 UM960 UART TX，GND 与 GND 相连。
-- 确认 USB-TTL 的逻辑电平与接收机 UART 电平兼容；不要把 RS-232 电平接到 TTL UART，也不要在未确认前连接 VCC。
-- 在接收机中将该 UART 配置为输出 NMEA GGA，并允许该 UART 输入 RTCM 3.x。接收机与脚本的波特率必须一致。
-- 如果使用 COM2，可按 UM960 设备手册配置：
+## ROS 2 安装与运行
 
-  ```text
-  UNLOGALL COM2
-  GPGGA COM2 1
-  SAVECONFIG
-  ```
-
-  `GPGGA`、串口号和波特率必须与实际端口一致；如果设备输出的是 `GNGGA`，脚本同样支持。确认该端口同时允许接收 RTCM 输入。
-- Linux 下可用 `ls /dev/serial/by-id/` 查找 CH340 设备，常见设备名为 `/dev/ttyUSB0`。
-- 长时间运行优先使用 `/dev/serial/by-id/` 下的设备路径，避免拔插后 `ttyUSB` 编号变化；若 CH340 没有唯一 ID，可使用合适的 `by-path` 路径。
-
-## 安装和运行
-
-需要已安装的 ROS 2、`colcon`、`rosdep`，可访问 NTRIP 服务的网络，以及具有串口读写权限的运行用户。接收机需要连接 GNSS 天线并获得单点定位。
-
-本项目是 `ament_cmake` ROS 2 包，CMake 会将 Python 脚本安装为 ROS 可执行程序。虚拟环境使用系统 Python 并启用系统 site-packages，以便加载 ROS 2 的 `rclpy`；`uv sync` 安装项目锁定的 Python 依赖。
-
-将本项目放在 ROS 2 工作区的 `src` 目录下，加载 ROS 环境并安装依赖：
+需要已安装的 ROS 2、`colcon`、`rosdep`、`uv`、可访问 CORS 服务商的网络，以及串口读写权限。
 
 ```bash
 source /opt/ros/$ROS_DISTRO/setup.bash
@@ -45,6 +28,8 @@ git clone https://github.com/KangjianPeng/ntrip-relay.git
 cd ntrip-relay
 uv venv --system-site-packages --python /usr/bin/python3
 uv sync --locked
+cp .env.example .env
+chmod 600 .env
 cd ~/ros2_ws
 rosdep install --from-paths src --ignore-src -r -y
 colcon build --packages-select ntrip_gnss_relay
@@ -52,128 +37,111 @@ source install/setup.bash
 source src/ntrip-relay/.venv/bin/activate
 ```
 
-启动 ROS 2 节点：
+编辑 `src/ntrip-relay/.env`，填写串口和 CORS 服务商提供的连接参数、账号密码，然后启动节点：
+
+```bash
+ros2 run ntrip_gnss_relay ntrip_gnss_relay \
+  --env-file "$HOME/ros2_ws/src/ntrip-relay/.env"
+```
+
+本项目是 `ament_cmake` ROS 2 包。CMake 安装 Python 入口为 `ntrip_gnss_relay`；虚拟环境启用系统 site-packages，以便访问 ROS 2 的 `rclpy` 和 `nmea_msgs`。Python 依赖包括 `pyserial`、`pynmea2` 和 `python-dotenv`。
+
+默认读取脚本所在目录的 `.env`，可通过 `--env-file /path/to/.env` 指定其他配置文件。也可以在启动时覆盖配置：
 
 ```bash
 ros2 run ntrip_gnss_relay ntrip_gnss_relay \
   --serial /dev/ttyUSB0 \
   --baud 115200 \
-  --caster-port 8002 \
-  --mount RTCM33_GRCEJ \
-  --username '你的卡号'
+  --host caster.example.com \
+  --caster-port 2101 \
+  --mount YOUR_MOUNTPOINT \
+  --username YOUR_USERNAME \
+  --ros-args -r /gnss/gga:=/robot/gnss/gga
 ```
 
-运行时按提示输入密码。默认连接 `rtkcq.cn`；端口 `8001` 为 ITRF2008，`8002` 为 WGS84（参考历元 2005），`8003` 为 CGCS2000（参考历元 2000）。挂载点可选 `RTCM33_GRC` 或 `RTCM33_GRCEJ`。
+`caster.example.com` 和 `YOUR_MOUNTPOINT` 是占位示例，需替换为实际服务参数。未设置密码时会交互询问；非交互运行需配置 `NTRIP_USER` 和 `NTRIP_PASSWORD`。凭据使用 TCP Basic Authentication，当前不支持 TLS。
 
-非交互运行也可以通过环境变量提供凭据；交互使用建议按提示输入密码，避免把密码写入 shell 历史：
+配置优先级：命令行参数 > 已有环境变量 > `.env` > 程序默认值。服务器和挂载点没有预设值，必须配置；端口默认 `2101`，支持 `1`～`65535`，不约定端口与坐标框架的关系。密码只通过 `.env`、环境变量或交互提示提供。
 
-```bash
-export NTRIP_USER='你的卡号'
-export NTRIP_PASSWORD='你的密码'
-ros2 run ntrip_gnss_relay ntrip_gnss_relay \
-  --serial /dev/serial/by-id/你的CH340 --baud 115200
-```
+| 参数 | 环境变量 / `.env` 键 | 默认值 |
+|---|---|---|
+| `--env-file` | — | 脚本所在目录的 `.env` |
+| `--serial` | `SERIAL_DEVICE` | 必填 |
+| `--baud` | `SERIAL_BAUD` | `115200` |
+| `--host` | `NTRIP_HOST` | 必填 |
+| `--caster-port` | `NTRIP_PORT` | `2101` |
+| `--mount` | `NTRIP_MOUNT` | 必填 |
+| `--username` | `NTRIP_USER` | 交互询问 |
+| 密码 | `NTRIP_PASSWORD` | 交互询问 |
+| `--gga-interval` | — | `5` 秒 |
+| `--gga-timeout` | — | `15` 秒 |
+| `--connect-timeout` | — | `10` 秒 |
+| `--rtcm-timeout` | — | `15` 秒 |
+| `--verbose` | — | 关闭 |
 
-密码会以 Basic Authentication 发送到服务端；当前服务端口是明文 TCP，不要在不可信网络中暴露凭据。
+Linux 原生后台部署与服务管理见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
 ## ROS 2 话题
 
-节点将校验通过的接收机 GGA 原句发布为 `nmea_msgs/msg/Sentence`，话题固定为 `/gnss/gga`。有效的无定位报文（`quality=0`）也会发布；损坏校验和及非 GGA 报文不会发布。`sentence` 字段保留接收机内容和校验和，不包含串口行尾；`header.stamp` 表示本机收到报文的 ROS 时间，因为 GGA 本身不包含日期。
-
-查看发布数据：
+节点将校验通过的原始 GGA 发布为 `nmea_msgs/msg/Sentence`，默认话题为 `/gnss/gga`。有效的未定位报文（`quality=0`）也会发布；校验错误或非 GGA 报文不会发布。`sentence` 保留接收机报文及校验和，不包含串口行尾；`header.stamp` 使用本机收到报文时的 ROS 时间。
 
 ```bash
 ros2 topic echo /gnss/gga nmea_msgs/msg/Sentence
 ```
 
-如需重映射，可通过 ROS 标准参数传入：
+## 定位状态与恢复
 
-```bash
-ros2 run ntrip_gnss_relay ntrip_gnss_relay \
-  --serial /dev/ttyUSB0 --username '你的卡号' \
-  --ros-args -r /gnss/gga:=/robot/gnss/gga
-```
+脚本严格验证 GGA 校验和，解析 UTC、经纬度、定位质量、卫星数、HDOP 和海拔。日志中的经纬度为十进制度，上报给服务的仍是接收机原始 GGA，仅统一行尾为 CRLF。不会生成或补填坐标。
 
-脚本只使用接收机实际输出的 GGA，严格验证接收机报文的校验和，并解析 UTC、经纬度、定位质量、卫星数、HDOP 和海拔。日志中的经纬度转换为十进制度；发给服务器的仍是接收机原始 GGA，仅统一行尾为 CRLF。脚本不会生成或补填坐标，已移除固定位置的 `--gga` 参数。
+- quality=1 表示单点定位，quality=5 表示 RTK FLOAT，quality=4 表示 RTK FIX。
+- quality=0 或坐标、UTC 不完整时，立即清除上一位置并暂停差分流；人工、模拟和推算位置不用于请求差分。
+- 每 5 秒发送一次有效 GGA。15 秒没有新的有效定位历元时，断开并等待新位置；可调整 `--gga-interval` 和 `--gga-timeout`。
+- 后台串口线程在网络连接和重试期间持续更新位置。串口重新打开或读取长时间暂停时，丢弃积压报文。
+- 重复的 UTC 历元不会刷新位置有效期；支持 UTC 跨午夜，时间回退时清除位置。
+- `--rtcm-timeout` 监测原始流字节活动。首包或后续数据超过期限时断开重连，不等同于 RTCM 校验或接收机成功解算。
+- 网络故障采用 1、2、4、8、16、30 秒退避，成功转发数据后复位。串口故障会重新打开设备。
+- 鉴权失败、挂载点不可用或返回源表时，以退出码 2 停止；临时服务故障和超时重试。按 `Ctrl+C` 关闭连接、串口和读取线程。
 
-脚本会每 5 秒发送一次接收机的有效 GGA。若接收机报告未定位，立即清除上一位置并暂停差分流；若 15 秒没有新的有效定位历元，也会断开并等待新位置。可用 `--gga-interval` 和 `--gga-timeout` 调整这两个时间。单点定位（quality=1）即可启动，不需要预先获得 RTK FIX；人工、模拟和推算位置不用于请求差分流。
-
-## 断线恢复与位置时效
-
-- 后台串口线程持续读取 GGA，网络连接或重试期间仍更新最新位置。串口首次打开、重新打开或读取曾暂停超过 GGA 有效期时，清除积压数据并等待新报文。
-- 有效位置必须带 UTC。重复报送同一个 UTC 历元不会刷新位置有效期；UTC 跨午夜可正常处理，时间回退则清除位置并等待下一历元。GGA 不含日期，无法单靠它检测整日重放，也无法证明服务端坐标框架是否正确。
-- `--rtcm-timeout` 默认 15 秒：在此时间内未收到首包，或后续数据持续中断，都会断开 NTRIP 并重连。此处监测原始流字节活动，不等同于 RTCM CRC 校验或接收机成功解算。
-- 网络异常采用 1、2、4、8、16、30 秒退避；首次成功收到并转发数据后复位。网络重试保持串口读取线程运行。
-- 串口读写失败时关闭旧对象，再尝试重新打开设备，并创建新的 GGA 读取器。启动时设备不存在也会等待重试。配置的设备路径必须在拔插后仍指向同一个 CH340。
-- `401/403`、错误挂载点或返回源表时，输出明确错误并以退出码 2 停止。服务器 `5xx` 和网络超时按临时故障重试。按 `Ctrl+C` 关闭线程、网络连接和串口。
-
-常用参数：
-
-| 参数 | 默认值 | 作用 |
-|---|---:|---|
-| `--serial` | 必填 | CH340 设备路径 |
-| `--baud` | `115200` | 接收机与 CH340 的串口波特率 |
-| `--host` | `rtkcq.cn` | NTRIP 服务域名或 IP |
-| `--caster-port` | `8002` | `8001` ITRF2008、`8002` WGS84、`8003` CGCS2000 |
-| `--mount` | `RTCM33_GRCEJ` | RTCM 挂载点 |
-| `--username` | 环境变量或提示输入 | NTRIP 卡号，可用 `NTRIP_USER` 提供 |
-| `--gga-interval` | `5` 秒 | 发送 GGA 的周期 |
-| `--gga-timeout` | `15` 秒 | GGA 定位历元的最大年龄 |
-| `--connect-timeout` | `10` 秒 | 网络连接和响应头等待时间 |
-| `--rtcm-timeout` | `15` 秒 | RTCM 首包/后续数据最大等待时间 |
-| `--verbose` | 关闭 | 输出原始 GGA 和调试日志 |
-
-## 坐标框架与挂载点
-
-坐标框架应与地图、控制点和下游系统一致。选错 WGS84/CGCS2000/ITRF 端口时，接收机仍可能得到 RTK 固定解，但绝对坐标会跟随基准站的框架和参考历元，与目标数据存在系统偏差。FIX 不证明坐标框架正确；NMEA 格式或接收机输出标签也不能自动把差分结果转换为目标框架。切换端口可能造成位置跳变，应在同框架、同参考历元的已知控制点上确认。
-
-挂载点不存在或没有访问权限时无法获得流。挂载点存在但观测星座、频点或消息类型不适配接收机时，可能只有部分消息可用，表现为固定较慢、FLOAT 或无法 RTK；较少星座的挂载点也可能正常固定。选择距离很远的实体参考站时，公共卫星和大气误差相关性变差，精度与固定可靠性可能下降；网络/VRS 服务需持续上报真实 GGA。能够连接和收到 RTCM 不保证基站坐标或最终定位正确。
-
-## 原始 GGA 与未定位状态
+例如：
 
 ```text
 $GNGGA,,,,,,0,,,,,,,,*78
 ```
 
-这是校验和正确的 GGA，但 `quality=0` 且经纬度为空，表示当前未定位。卫星数、HDOP、海拔和 UTC 同样未提供，不能当成零坐标。脚本会解析出未定位状态并等待有效坐标，不会虚构位置来请求 RTCM。
+这是校验正确的未定位报文，不能作为零坐标或虚拟位置使用。如果持续收到它，请检查天线连接、供电和天空可见性，等待接收机获得真实单点定位。完整的串口报文只说明通信可读，不代表已经定位。
 
-如果一直收到这条报文，请检查 GNSS 天线连接、天线供电和天空可见性，并在室外等待接收机获得单点定位。持续收到完整且校验正确的 GGA 说明串口数据可读取，但不代表天线或定位已正常。添加 `--verbose` 可查看原始 GGA 日志。
+## 坐标框架与数据兼容性
+
+挂载点、坐标框架和参考历元由 CORS 服务商定义，应与地图、控制点和下游系统一致。端口编号没有通用的框架含义。RTK FIX 不能证明坐标框架正确，应使用同框架、同参考历元的已知控制点验证绝对坐标。
+
+服务的星座、频点和 RTCM 消息必须兼容接收机。能够连接并收到数据，不保证接收机能解算或固定。网络/VRS 服务需要持续上报真实位置；距离过远的实体参考站也可能降低精度与固定可靠性。
 
 ## 常见问题
 
-| 现象 | 检查方法 |
+| 现象 | 检查项 |
 |---|---|
-| 串口不存在或一直重开 | 检查 USB 连接、设备路径；优先使用稳定的 `by-id` 路径 |
-| Permission denied | 用 `ls -l` 和 `id` 检查串口属组与用户权限；不要同时运行其他占用串口的软件 |
-| 一直等待 GGA | 检查 TX/RX 交叉接线、波特率、UART 的 GGA 输出配置；用 `--verbose` 查看报文 |
-| GGA 质量为 0 | 检查天线连接、供电和天空可见性，在室外等待单点定位 |
-| GGA 定位历元未推进 | 检查接收机时间输出，避免重放文件或反复发送同一报文 |
-| 401/403、Bad MountPoint | 检查账号有效期、密码、挂载点和账号授权；修正后重新运行 |
-| RTCM 超时 | 检查网络和服务状态、挂载点是否覆盖当前位置；根据实际数据周期调整超时 |
-| 有数据但没有 FIX | 检查串口 RTCM 输入、卫星信号、差分龄期和接收机支持的消息/频点 |
+| 串口打不开 | 设备路径、USB 连接、用户串口权限 |
+| 一直等待 GGA | TX/RX 接线、波特率、接收机 GGA 输出配置 |
+| quality=0 | 天线连接、供电、天空可见性 |
+| 定位历元未推进 | 接收机 UTC 输出，是否反复发送同一报文 |
+| 401/403 或挂载点错误 | 账号有效期、密码、挂载点名称和授权 |
+| RTCM 超时 | 网络、服务状态、位置覆盖和实际数据周期 |
+| 有差分但没有 FIX | 串口 RTCM 输入、支持的消息、信号质量和差分龄期 |
 
-查看串口和参数：
-
-```bash
-ls -l /dev/serial/by-id/
-ros2 run ntrip_gnss_relay ntrip_gnss_relay --help
-```
+可添加 `--verbose` 查看原始报文和调试日志。测试时保持一个程序读取串口，避免争抢数据。
 
 ## 项目结构与测试
 
 ```text
-ntrip_gnss_relay.py   GGA 解析、ROS 2 发布、NTRIP 连接、串口转发与恢复逻辑
-CMakeLists.txt        colcon/ament_cmake 安装入口
-package.xml           ROS 2 包名和 ROS 运行依赖
-LICENSE               MIT 许可证
-pyproject.toml        Python 版本和 uv 运行依赖
-uv.lock               锁定依赖版本
-tests/test_gga.py     定位报文与有效位置转发测试
-tests/test_recovery.py 断线恢复、协议响应、TCP/伪终端集成测试
-Uprecise.md           UM960 接收机配置速查
+ntrip_gnss_relay.py              GGA 解析、ROS 2 发布、NTRIP 转发与恢复
+CMakeLists.txt / package.xml    ROS 2 包构建和运行依赖
+.env.example               不含凭据的配置模板
+deploy/ntrip-relay.service  Linux systemd 部署示例
+pyproject.toml / uv.lock    Python 依赖和锁定版本
+tests/test_config.py       配置优先级、通用端口和挂载点验证
+tests/test_gga.py          GGA 与定位状态验证
+tests/test_recovery.py     断线恢复、协议响应、TCP/伪终端集成测试
 ```
-
-运行验证：
 
 ```bash
 uv sync --locked
@@ -184,13 +152,6 @@ uvx ruff check ntrip_gnss_relay.py tests
 uvx ruff format --check ntrip_gnss_relay.py tests
 ```
 
-测试使用隔离的样例 GGA、本机 TCP 服务和模拟串口；不会连接真实 CORS 账号。TCP/伪终端集成测试仅在 POSIX 系统运行，Windows 会跳过该项。
+测试使用隔离样例、本机 TCP 服务和模拟串口，不连接实际差分账号。TCP/伪终端集成测试仅在 POSIX 系统运行。
 
-## 当前限制
-
-- CORS 服务商提供的三个端口和两个挂载点是本项目默认配置，框架/历元信息以 CORS 服务商确认结果为准。
-- 当前使用明文 TCP Basic 鉴权，不支持 TLS、HTTP chunked 或压缩响应体。
-- RTCM 按原始字节转发，未进行帧 CRC 校验、坐标转换或基站真实性验证。日志中的转发字节数不证明接收机已成功解算。
-- GGA 不含日期，无法独立识别整日重放或所有陈旧定位情况。
-
-串口号、波特率、接收机 NMEA 输出和权限因设备与系统而异；需要在实际接收机/USB-TTL 链路上确认 RTK 状态进入 FLOAT/FIX，并使用同框架、同参考历元的控制点检查绝对坐标。
+当前支持明文 TCP Basic 鉴权，不支持 TLS、HTTP chunked 或压缩响应体。RTCM 按原始字节转发，未做帧 CRC 校验、坐标转换或基站验证。GGA 不含日期，无法独立识别整日重放或所有陈旧定位情况。

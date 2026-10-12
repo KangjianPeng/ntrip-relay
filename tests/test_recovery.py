@@ -25,7 +25,7 @@ def position_at(timestamp):
 def arguments():
     return SimpleNamespace(
         host="localhost",
-        caster_port=8002,
+        caster_port=2101,
         mount="TEST",
         connect_timeout=2,
         serial="/dev/fake",

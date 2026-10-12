@@ -181,7 +181,7 @@ class RelayPositionTests(unittest.TestCase):
         self.reader = GgaReader(self.port, stale_after=15)
         self.args = SimpleNamespace(
             host="localhost",
-            caster_port=8002,
+            caster_port=2101,
             mount="TEST",
             connect_timeout=2,
             gga_interval=5,
