@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.10"
 
 [[package]]
-name = "ntrip-um960-relay"
+name = "ntrip-gnss-relay"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

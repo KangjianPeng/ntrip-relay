@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>ntrip_um960_relay</name>
+  <name>ntrip_gnss_relay</name>
   <version>0.1.0</version>
-  <description>Forward NTRIP RTCM corrections to a UM960 and publish receiver GGA to ROS 2.</description>
+  <description>Forward NTRIP RTCM corrections to a GNSS receiver and publish GGA to ROS 2.</description>
   <maintainer email="pkjinfinity@outlook.com">Kangjian Peng</maintainer>
   <license>MIT</license>
 

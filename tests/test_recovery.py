@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import pynmea2
 import serial
 
-import ntrip_um960_relay as relay
+import ntrip_gnss_relay as relay
 from tests.test_gga import NO_FIX, POSITION, FakeSerial, FakeSocket
 
 

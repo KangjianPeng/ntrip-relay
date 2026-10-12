@@ -1,7 +1,7 @@
 [project]
-name = "ntrip-um960-relay"
+name = "ntrip-gnss-relay"
 version = "0.1.0"
-description = "Forward NTRIP RTCM corrections to a UM960 receiver over USB serial"
+description = "Forward NTRIP RTCM corrections to a GNSS receiver over USB serial"
 requires-python = ">=3.10"
 dependencies = [
     "pyserial>=3.5",
