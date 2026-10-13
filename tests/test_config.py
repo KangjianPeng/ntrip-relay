@@ -159,7 +159,7 @@ class EnvConfigTests(unittest.TestCase):
         publisher = MagicMock()
         with (
             patch.object(relay, "run_relay", return_value=0) as run,
-            patch.object(relay, "Ros2GgaPublisher", return_value=publisher) as ros,
+            patch.object(relay, "Ros2PvtPublisher", return_value=publisher) as ros,
             patch.object(relay.logging, "basicConfig"),
             patch("builtins.input") as prompt,
             patch.object(relay.getpass, "getpass") as password_prompt,

@@ -1,17 +1,18 @@
 # GNSS NTRIP Relay
 
-将 GNSS 接收机实际输出的 NMEA GGA 通过 NTRIP 上报给 CORS 服务商，再把服务返回的 RTCM 数据通过串口写回接收机。适用于能够输出 GGA 并接收 RTCM 的 GNSS 接收机和提供兼容 NTRIP 数据流的服务；接收机型号、串口适配器、服务域名、端口和挂载点均由使用者选择。
+将 GNSS 接收机实际输出的 NMEA GGA 通过 NTRIP 上报给 CORS 服务商，再把服务返回的 RTCM 数据通过串口写回接收机。节点读取 GGA、GSA、GST 和 RMC，组合成 FAST-LIVO2-RTK 使用的 GNSS PVT 话题。适用于能够输出这些 NMEA 报文并接收 RTCM 的接收机和提供兼容 NTRIP 数据流的服务；接收机型号、串口适配器、服务域名、端口和挂载点均由使用者选择。
 
 ```text
-接收机 TX (GGA) -> 串口适配器 RX -> NTRIP
-                    +-> ROS 2 /gnss/gga
+接收机 TX (GGA/GSA/GST/RMC) -> 串口适配器 RX -> 本节点
+                                                +-> ROS 2 /ublox_driver/receiver_pvt
+                                                +-> NTRIP (仅 GGA)
 接收机 RX (RTCM) <- 串口适配器 TX <- NTRIP
 ```
 
 ## 接收机与接线
 
 - 接收机 UART TX 接串口适配器 RX，接收机 UART RX 接适配器 TX，GND 共地。
-- 按接收机手册配置同一 UART 输出带校验和的 NMEA GGA，并接受服务返回的 RTCM 消息。脚本不会发送厂商专用配置命令。
+- 按接收机手册配置同一 UART 输出带校验和的 NMEA GGA（10 Hz）、GSA（1 Hz）、GST（10 Hz）和 RMC（10 Hz），并接受服务返回的 RTCM 消息。脚本不会发送厂商专用配置命令，也不会更改接收机输出频率。
 - 接收机与脚本波特率一致；适配器的电平必须兼容接收机 UART，不能直接混接 TTL 与 RS-232。
 - 接收机需要连接 GNSS 天线，并获得真实定位。单点定位即可开始请求差分，无需预先取得 RTK FIX。
 - Linux 可用 `ls -l /dev/serial/by-id/` 查找设备，长期运行建议使用稳定的 `by-id` 或 `by-path` 路径。Windows 可使用 `COM3` 等名称。
@@ -40,6 +41,7 @@ source /opt/ros/$ROS_DISTRO/setup.bash
 mkdir -p ~/ros2_ws/src
 cd ~/ros2_ws/src
 git clone https://github.com/KangjianPeng/ntrip-relay.git
+git clone --branch humble https://github.com/KangjianPeng/gnss_comm.git
 cd ntrip-relay
 uv venv --system-site-packages --python /usr/bin/python3
 uv sync --locked
@@ -47,7 +49,7 @@ cp .env.example .env
 chmod 600 .env
 cd ~/ros2_ws
 rosdep install --from-paths src --ignore-src -r -y
-colcon build --packages-select ntrip_gnss_relay
+colcon build --packages-select gnss_comm ntrip_gnss_relay
 source install/setup.bash
 source src/ntrip-relay/.venv/bin/activate
 ```
@@ -59,7 +61,7 @@ ros2 run ntrip_gnss_relay ntrip_gnss_relay \
   --env-file "$HOME/ros2_ws/src/ntrip-relay/.env"
 ```
 
-本项目是 `ament_cmake` ROS 2 包。CMake 安装 Python 入口为 `ntrip_gnss_relay`；虚拟环境启用系统 site-packages，以便访问 ROS 2 的 `rclpy` 和 `nmea_msgs`。Python 依赖包括 `pyserial`、`pynmea2` 和 `python-dotenv`。
+本项目是 `ament_cmake` ROS 2 包。CMake 安装 Python 入口为 `ntrip_gnss_relay`；虚拟环境启用系统 site-packages，以便访问 ROS 2 的 `rclpy` 和 `gnss_comm`。构建并 source 提供 `gnss_comm/msg/GnssPVTSolnMsg` 的 ROS 2 工作空间后再启动节点。Python 依赖包括 `pyserial`、`pynmea2` 和 `python-dotenv`。
 
 默认读取脚本所在目录的 `.env`，可通过 `--env-file /path/to/.env` 指定其他配置文件。也可以在启动时覆盖配置：
 
@@ -71,7 +73,8 @@ ros2 run ntrip_gnss_relay ntrip_gnss_relay \
   --caster-port 2101 \
   --mount YOUR_MOUNTPOINT \
   --username YOUR_USERNAME \
-  --ros-args -r /gnss/gga:=/robot/gnss/gga
+  --ros-args \
+  -r /ublox_driver/receiver_pvt:=/robot/gnss/receiver_pvt
 ```
 
 `caster.example.com` 和 `YOUR_MOUNTPOINT` 是占位示例，需替换为实际服务参数。未设置密码时会交互询问；非交互运行需配置 `NTRIP_USER` 和 `NTRIP_PASSWORD`。凭据使用 TCP Basic Authentication，当前不支持 TLS。
@@ -96,10 +99,16 @@ ros2 run ntrip_gnss_relay ntrip_gnss_relay \
 
 ## ROS 2 话题
 
-节点将校验通过的原始 GGA 发布为 `nmea_msgs/msg/Sentence`，默认话题为 `/gnss/gga`。有效的未定位报文（`quality=0`）也会发布；校验错误或非 GGA 报文不会发布。`sentence` 保留接收机报文及校验和，不包含串口行尾；`header.stamp` 使用本机收到报文时的 ROS 时间。
+节点校验 GGA、GSA、GST 和 RMC，并将有效定位转为 `gnss_comm/msg/GnssPVTSolnMsg`，默认发布到 `/ublox_driver/receiver_pvt`，可通过 ROS 参数重映射。话题采用可靠 QoS，与 FAST-LIVO2-RTK 默认订阅配置匹配。UTC 日期和速度取自最近的有效 RMC，GGA UTC 作为定位历元；GPS 周和周内秒按 18 秒 GPS-UTC 闰秒差换算。椭球高由 GGA 海拔（MSL）加大地水准面差得到，因此仅在这两个字段均以米提供且 RMC 日期可用时发布。`fix_type` 使用 GSA 的 2D/3D 模式，差分与载波状态使用 GGA 定位质量，DOP 来自 GSA，水平/垂直精度来自 GST。未收到 GST 精度时 `h_acc` 和 `v_acc` 为 `0.0`；RMC 无效时速度为零。无效定位不会发布 PVT，避免下游将无效坐标用于初始化。
+
+| 话题 | 类型 / 来源 | 频率 |
+|---|---|---:|
+| `/ublox_driver/receiver_pvt` | `gnss_comm/msg/GnssPVTSolnMsg` | 最多 10 Hz |
+
+无效、无定位或不完整的 GGA 不会发布 PVT；校验失败或格式错误的辅助 NMEA 报文会被忽略。
 
 ```bash
-ros2 topic echo /gnss/gga nmea_msgs/msg/Sentence
+ros2 topic echo /ublox_driver/receiver_pvt gnss_comm/msg/GnssPVTSolnMsg
 ```
 
 ## 定位状态与恢复
@@ -141,12 +150,12 @@ $GNGGA,,,,,,0,,,,,,,,*78
 | RTCM 超时 | 网络、服务状态、位置覆盖和实际数据周期 |
 | 有差分但没有 FIX | 串口 RTCM 输入、支持的消息、信号质量和差分龄期 |
 
-可添加 `--verbose` 查看原始报文和调试日志。测试时保持一个程序读取串口，避免争抢数据。
+可添加 `--verbose` 查看 GGA 原始报文和调试日志。测试时保持一个程序读取串口，避免争抢数据。
 
 ## 项目结构与测试
 
 ```text
-ntrip_gnss_relay.py              GGA 解析、ROS 2 发布、NTRIP 转发与恢复
+ntrip_gnss_relay.py              NMEA 接收解析、ROS 2 发布、NTRIP 转发与恢复
 CMakeLists.txt / package.xml    ROS 2 包构建和运行依赖
 .env.example               不含凭据的配置模板
 pyproject.toml / uv.lock    Python 依赖和锁定版本
@@ -166,4 +175,4 @@ uvx ruff format --check ntrip_gnss_relay.py tests
 
 测试使用隔离样例、本机 TCP 服务和模拟串口，不连接实际差分账号。TCP/伪终端集成测试仅在 POSIX 系统运行。
 
-当前支持明文 TCP Basic 鉴权，不支持 TLS、HTTP chunked 或压缩响应体。RTCM 按原始字节转发，未做帧 CRC 校验、坐标转换或基站验证。GGA 不含日期，无法独立识别整日重放或所有陈旧定位情况。
+当前支持明文 TCP Basic 鉴权，不支持 TLS、HTTP chunked 或压缩响应体。RTCM 按原始字节转发，未做帧 CRC 校验、坐标转换或基站验证。NTRIP 使用的 GGA 不含日期，无法独立识别整日重放；PVT 日期取自最近的 RMC。

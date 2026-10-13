@@ -15,7 +15,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import time as utc_time
+from datetime import datetime, time as utc_time, timedelta, timezone
 from pathlib import Path
 
 import pynmea2
@@ -63,6 +63,12 @@ FIX_NAMES = {
     8: "模拟位置",
 }
 
+PVT_TOPIC = "/ublox_driver/receiver_pvt"
+GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc)
+GPS_UTC_LEAP_SECONDS = 18
+SECONDS_PER_GPS_WEEK = 604800
+RMC_MAX_AGE = 5.0
+
 
 @dataclass(frozen=True)
 class GgaData:
@@ -74,6 +80,7 @@ class GgaData:
     satellites: int | None
     hdop: float | None
     altitude_m: float | None
+    geoid_separation_m: float | None
 
     @property
     def has_position(self) -> bool:
@@ -83,6 +90,29 @@ class GgaData:
             and self.longitude is not None
             and self.time_utc is not None
         )
+
+
+@dataclass(frozen=True)
+class RmcData:
+    timestamp: datetime
+    speed_mps: float
+    course_deg: float
+    valid: bool
+
+
+@dataclass(frozen=True)
+class GsaData:
+    mode: int
+    pdop: float
+
+
+@dataclass(frozen=True)
+class GstData:
+    h_acc: float
+    v_acc: float
+
+
+AuxiliaryNmea = RmcData | GsaData | GstData
 
 
 def _valid_coordinate(raw: str, direction: str, limit: int) -> bool:
@@ -117,11 +147,16 @@ def parse_gga(value: str | bytes) -> GgaData | None:
         altitude = (
             float(message.altitude) if message.altitude not in (None, "") else None
         )
+        geoid_separation = (
+            float(message.geo_sep) if message.geo_sep not in (None, "") else None
+        )
         if satellites is not None and satellites < 0:
             return None
         if hdop is not None and (not math.isfinite(hdop) or hdop < 0):
             return None
         if altitude is not None and not math.isfinite(altitude):
+            return None
+        if geoid_separation is not None and not math.isfinite(geoid_separation):
             return None
         return GgaData(
             sentence=(text + "\r\n").encode("ascii"),
@@ -136,19 +171,76 @@ def parse_gga(value: str | bytes) -> GgaData | None:
             satellites=satellites,
             hdop=hdop,
             altitude_m=altitude if message.altitude_units == "M" else None,
+            geoid_separation_m=(
+                geoid_separation if message.geo_sep_units == "M" else None
+            ),
         )
     except (pynmea2.ParseError, ValueError, TypeError, OverflowError):
         return None
 
 
+def parse_auxiliary_nmea(value: str | bytes) -> AuxiliaryNmea | None:
+    """Parse the RMC, GSA, and GST fields used to assemble a PVT solution."""
+    try:
+        text = value.decode("ascii") if isinstance(value, bytes) else value
+        text = text.strip()
+        if not text.startswith("$"):
+            return None
+        message = pynmea2.parse(text, check=True)
+        sentence_type = message.sentence_type
+        if sentence_type == "RMC":
+            timestamp = datetime.combine(
+                message.datestamp,
+                message.timestamp,
+            ).replace(tzinfo=timezone.utc)
+            speed = float(message.spd_over_grnd or 0.0) * 0.5144444444444445
+            course = float(message.true_course or 0.0)
+            if (
+                not math.isfinite(speed)
+                or speed < 0
+                or not math.isfinite(course)
+                or not 0 <= course <= 360
+            ):
+                return None
+            return RmcData(
+                timestamp=timestamp,
+                speed_mps=speed,
+                course_deg=course,
+                valid=message.status == "A",
+            )
+        if sentence_type == "GSA":
+            mode = int(message.mode)
+            pdop = float(message.pdop) if message.pdop else 0.0
+            if mode not in (1, 2, 3) or not math.isfinite(pdop) or pdop < 0:
+                return None
+            return GsaData(mode=mode, pdop=pdop)
+        if sentence_type == "GST":
+            lat_error = float(message.latitude_error or 0.0)
+            lon_error = float(message.longitude_error or 0.0)
+            alt_error = float(message.altitude_error or 0.0)
+            if any(
+                not math.isfinite(error) or error < 0
+                for error in (lat_error, lon_error, alt_error)
+            ):
+                return None
+            return GstData(
+                h_acc=math.hypot(lat_error, lon_error),
+                v_acc=alt_error,
+            )
+        return None
+    except (pynmea2.ParseError, ValueError, TypeError, OverflowError):
+        return None
+
+
 class GgaReader:
-    """Continuously retain the latest checked GGA and propagate UART faults."""
+    """Read checked NMEA sentences and retain the latest usable GGA."""
 
     def __init__(
         self,
         serial_port,
         stale_after: float,
         on_gga: Callable[[GgaData], None] | None = None,
+        on_auxiliary_nmea: Callable[[AuxiliaryNmea], None] | None = None,
     ):
         self.serial_port = serial_port
         self.stale_after = stale_after
@@ -164,11 +256,15 @@ class GgaReader:
         self._last_utc_seconds: float | None = None
         self._epoch_changed_at: float | None = None
         self.on_gga = on_gga
+        self.on_auxiliary_nmea = on_auxiliary_nmea
         self._last_callback_error: float | None = None
+        self._last_auxiliary_callback_error: float | None = None
 
     def __enter__(self):
         self._discard_backlog()
-        self._thread = threading.Thread(target=self._run, name="gnss-gga", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="gnss-nmea", daemon=True
+        )
         self._thread.start()
         return self
 
@@ -258,7 +354,7 @@ class GgaReader:
                     self._last_callback_error is None
                     or now - self._last_callback_error >= 5
                 ):
-                    LOG.exception("发布接收机 GGA 数据失败")
+                    LOG.exception("发布 GNSS PVT 数据失败")
                     self._last_callback_error = now
         return usable
 
@@ -273,10 +369,27 @@ class GgaReader:
             line, _, remainder = self.buffer.partition(b"\n")
             self.buffer[:] = remainder
             gga = parse_gga(bytes(line))
-            if gga is None:
-                LOG.debug("忽略非 GGA 或校验/格式错误的串口报文：%r", line[:160])
+            now = time.monotonic()
+            if gga is not None:
+                self._record(gga, now)
                 continue
-            self._record(gga, time.monotonic())
+            sentence = parse_auxiliary_nmea(bytes(line))
+            if sentence is not None:
+                if self.on_auxiliary_nmea is not None:
+                    try:
+                        self.on_auxiliary_nmea(sentence)
+                        self._last_auxiliary_callback_error = None
+                    except Exception:
+                        if (
+                            self._last_auxiliary_callback_error is None
+                            or now - self._last_auxiliary_callback_error >= 5
+                        ):
+                            LOG.exception("处理接收机辅助 NMEA 数据失败")
+                            self._last_auxiliary_callback_error = now
+                continue
+            LOG.debug(
+                "忽略不支持的 NMEA 或校验/格式错误的串口报文：%r", line[:160]
+            )
 
         # Recover from garbage or incomplete oversized sentences on the UART.
         if len(self.buffer) > 8192:
@@ -333,24 +446,26 @@ class GgaReader:
             self._stop.wait(0.1)
 
 
-class Ros2GgaPublisher:
-    """Publish checked receiver sentences as nmea_msgs/msg/Sentence."""
+class Ros2PvtPublisher:
+    """Publish GNSS PVT solutions assembled from checked NMEA sentences."""
 
-    topic = "/gnss/gga"
+    topic = PVT_TOPIC
 
     def __init__(self, ros_args: list[str]):
         try:
             import rclpy
-            from nmea_msgs.msg import Sentence
+            from gnss_comm.msg import GnssPVTSolnMsg
             from rclpy.executors import SingleThreadedExecutor
             from rclpy.node import Node
-            from rclpy.qos import qos_profile_sensor_data
+            from rclpy.qos import QoSProfile, ReliabilityPolicy
             from rclpy.signals import SignalHandlerOptions
         except ImportError as exc:
-            raise RuntimeError("需要先安装并加载 ROS 2、rclpy 和 nmea_msgs") from exc
+            raise RuntimeError(
+                "需要先安装并加载 ROS 2、rclpy 和 gnss_comm"
+            ) from exc
 
         self.rclpy = rclpy
-        self.Sentence = Sentence
+        self.GnssPVTSolnMsg = GnssPVTSolnMsg
         self.owns_context = not rclpy.ok()
         if self.owns_context:
             rclpy.init(
@@ -358,21 +473,124 @@ class Ros2GgaPublisher:
                 signal_handler_options=SignalHandlerOptions.NO,
             )
         self.node = Node("ntrip_gnss_relay")
-        self.publisher = self.node.create_publisher(
-            Sentence, self.topic, qos_profile_sensor_data
+        self.pvt_publisher = self.node.create_publisher(
+            GnssPVTSolnMsg,
+            self.topic,
+            QoSProfile(
+                depth=2000,
+                reliability=ReliabilityPolicy.RELIABLE,
+            ),
         )
+        self._latest_rmc: tuple[datetime, float, float, bool] | None = None
+        self._latest_rmc_received_at: float | None = None
+        self._latest_gsa: tuple[int, float] | None = None
+        self._latest_gsa_received_at: float | None = None
+        self._latest_gst: tuple[float, float] | None = None
+        self._latest_gst_received_at: float | None = None
+        self._pending_gga: tuple[GgaData, float] | None = None
         self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.node)
         self._thread = threading.Thread(
-            target=self.executor.spin, name="ros2-gga", daemon=True
+            target=self.executor.spin, name="ros2-pvt", daemon=True
         )
         self._thread.start()
 
     def publish(self, gga: GgaData) -> None:
-        message = self.Sentence()
-        message.header.stamp = self.node.get_clock().now().to_msg()
-        message.sentence = gga.sentence.decode("ascii").rstrip("\r\n")
-        self.publisher.publish(message)
+        now = time.monotonic()
+        if not self._publish_pvt(gga, now):
+            self._pending_gga = (gga, now)
+
+    def update_auxiliary(self, sentence: AuxiliaryNmea) -> None:
+        now = time.monotonic()
+        if isinstance(sentence, RmcData):
+            self._latest_rmc = (
+                sentence.timestamp,
+                sentence.speed_mps,
+                sentence.course_deg,
+                sentence.valid,
+            )
+            self._latest_rmc_received_at = now
+            pending = self._pending_gga
+            if pending is not None and now - pending[1] <= RMC_MAX_AGE:
+                self._publish_pvt(pending[0], now)
+                self._pending_gga = None
+        elif isinstance(sentence, GsaData):
+            self._latest_gsa = (sentence.mode, sentence.pdop)
+            self._latest_gsa_received_at = now
+        elif isinstance(sentence, GstData):
+            self._latest_gst = (sentence.h_acc, sentence.v_acc)
+            self._latest_gst_received_at = now
+
+    def _publish_pvt(self, gga: GgaData, now: float) -> bool:
+        if (
+            not gga.has_position
+            or gga.altitude_m is None
+            or gga.geoid_separation_m is None
+            or self._latest_rmc is None
+            or self._latest_rmc_received_at is None
+            or now - self._latest_rmc_received_at > RMC_MAX_AGE
+        ):
+            return False
+
+        rmc_time, speed, course, rmc_valid = self._latest_rmc
+        try:
+            gga_time = utc_time.fromisoformat(gga.time_utc)
+        except (TypeError, ValueError):
+            return False
+        utc_timestamp = datetime.combine(rmc_time.date(), gga_time).replace(
+            tzinfo=timezone.utc
+        )
+        date_delta = (utc_timestamp - rmc_time).total_seconds()
+        if date_delta > 43200:
+            utc_timestamp -= timedelta(days=1)
+        elif date_delta < -43200:
+            utc_timestamp += timedelta(days=1)
+        gps_timestamp = utc_timestamp + timedelta(seconds=GPS_UTC_LEAP_SECONDS)
+        gps_elapsed = (gps_timestamp - GPS_EPOCH).total_seconds()
+        week, tow = divmod(gps_elapsed, SECONDS_PER_GPS_WEEK)
+
+        msg = self.GnssPVTSolnMsg()
+        msg.time.week = int(week)
+        msg.time.tow = tow
+        msg.fix_type = (
+            2
+            if self._has_recent_gsa(now) and self._latest_gsa[0] == 2
+            else 3
+        )
+        msg.valid_fix = True
+        msg.diff_soln = gga.quality in (2, 4, 5)
+        msg.carr_soln = {4: 2, 5: 1}.get(gga.quality, 0)
+        msg.num_sv = gga.satellites or 0
+        msg.latitude = gga.latitude
+        msg.longitude = gga.longitude
+        msg.altitude = gga.altitude_m + gga.geoid_separation_m
+        msg.height_msl = gga.altitude_m
+        msg.p_dop = self._latest_gsa[1] if self._has_recent_gsa(now) else 0.0
+        msg.h_acc, msg.v_acc = (
+            self._latest_gst if self._has_recent_gst(now) else (0.0, 0.0)
+        )
+        speed_mps = speed if rmc_valid else 0.0
+        course_rad = math.radians(course)
+        msg.vel_n = speed_mps * math.cos(course_rad)
+        msg.vel_e = speed_mps * math.sin(course_rad)
+        msg.vel_d = 0.0
+        msg.vel_acc = 0.0
+        self.pvt_publisher.publish(msg)
+        return True
+
+    def _has_recent_gsa(self, now: float) -> bool:
+        return (
+            self._latest_gsa is not None
+            and self._latest_gsa_received_at is not None
+            and now - self._latest_gsa_received_at <= 5.0
+        )
+
+    def _has_recent_gst(self, now: float) -> bool:
+        return (
+            self._latest_gst is not None
+            and self._latest_gst_received_at is not None
+            and now - self._latest_gst_received_at <= 2.0
+        )
 
     def close(self) -> None:
         self.executor.shutdown()
@@ -567,6 +785,7 @@ def run_relay(
     username: str,
     password: str,
     on_gga: Callable[[GgaData], None] | None = None,
+    on_auxiliary_nmea: Callable[[AuxiliaryNmea], None] | None = None,
 ) -> int:
     """Keep reading through network retries; reopen the UART after serial faults."""
 
@@ -588,9 +807,12 @@ def run_relay(
                 dsrdtr=False,
             ) as serial_port:
                 LOG.info("串口已打开：%s @ %d baud", args.serial, args.baud)
-                LOG.info("GGA 来源：接收机串口实时 NMEA 输出")
+                LOG.info("NMEA 来源：接收机串口实时 GGA/GSA/GST/RMC 输出")
                 with GgaReader(
-                    serial_port, args.gga_timeout, on_gga=on_gga
+                    serial_port,
+                    args.gga_timeout,
+                    on_gga=on_gga,
+                    on_auxiliary_nmea=on_auxiliary_nmea,
                 ) as gga_reader:
                     while True:
                         try:
@@ -733,9 +955,9 @@ def main(argv=None) -> int:
         return 2
 
     try:
-        ros_publisher = Ros2GgaPublisher(args.ros_args)
+        pvt_publisher = Ros2PvtPublisher(args.ros_args)
     except (ImportError, RuntimeError) as exc:
-        LOG.error("无法启动 ROS 2 GGA 发布：%s", exc)
+        LOG.error("无法启动 ROS 2 GNSS 发布：%s", exc)
         return 2
 
     try:
@@ -743,13 +965,14 @@ def main(argv=None) -> int:
             args,
             username,
             password,
-            on_gga=ros_publisher.publish,
+            on_gga=pvt_publisher.publish,
+            on_auxiliary_nmea=pvt_publisher.update_auxiliary,
         )
     except KeyboardInterrupt:
         LOG.info("已停止")
         return 0
     finally:
-        ros_publisher.close()
+        pvt_publisher.close()
 
 
 if __name__ == "__main__":
