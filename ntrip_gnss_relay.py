@@ -63,7 +63,7 @@ FIX_NAMES = {
     8: "模拟位置",
 }
 
-PVT_TOPIC = "/ublox_driver/receiver_pvt"
+PVT_TOPIC = "/gnss/pvt"
 GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc)
 GPS_UTC_LEAP_SECONDS = 18
 SECONDS_PER_GPS_WEEK = 604800
@@ -209,7 +209,7 @@ def parse_auxiliary_nmea(value: str | bytes) -> AuxiliaryNmea | None:
                 valid=message.status == "A",
             )
         if sentence_type == "GSA":
-            mode = int(message.mode)
+            mode = int(message.mode_fix_type)
             pdop = float(message.pdop) if message.pdop else 0.0
             if mode not in (1, 2, 3) or not math.isfinite(pdop) or pdop < 0:
                 return None

@@ -4,7 +4,7 @@
 
 ```text
 接收机 TX (GGA/GSA/GST/RMC) -> 串口适配器 RX -> 本节点
-                                                +-> ROS 2 /ublox_driver/receiver_pvt
+                                                +-> ROS 2 /gnss/pvt
                                                 +-> NTRIP (仅 GGA)
 接收机 RX (RTCM) <- 串口适配器 TX <- NTRIP
 ```
@@ -12,10 +12,23 @@
 ## 接收机与接线
 
 - 接收机 UART TX 接串口适配器 RX，接收机 UART RX 接适配器 TX，GND 共地。
-- 按接收机手册配置同一 UART 输出带校验和的 NMEA GGA（10 Hz）、GSA（1 Hz）、GST（10 Hz）和 RMC（10 Hz），并接受服务返回的 RTCM 消息。脚本不会发送厂商专用配置命令，也不会更改接收机输出频率。
+- 按接收机手册配置同一 UART 输出带校验和的 NMEA GGA（10 Hz）和 RMC（10 Hz）；建议同时输出 GSA（1 Hz）与 GST（10 Hz），并接受服务返回的 RTCM 消息。脚本不会发送厂商专用配置命令，也不会更改接收机输出频率。
 - 接收机与脚本波特率一致；适配器的电平必须兼容接收机 UART，不能直接混接 TTL 与 RS-232。
 - 接收机需要连接 GNSS 天线，并获得真实定位。单点定位即可开始请求差分，无需预先取得 RTK FIX。
 - Linux 可用 `ls -l /dev/serial/by-id/` 查找设备，长期运行建议使用稳定的 `by-id` 或 `by-path` 路径。Windows 可使用 `COM3` 等名称。
+
+### NMEA 0183 输出字段
+
+节点识别 `GGA`、`RMC`、`GSA`、`GST` 四种报文。`GP`、`GN` 等 talker ID 均可；报文需包含正确校验和。下表列出节点实际读取的标准字段：
+
+| 报文 | 必需程度 / 建议频率 | 节点使用的字段 | 用途及缺失行为 |
+|---|---|---|---|
+| `GGA` | 必需；10 Hz | UTC 时间、纬度及 N/S、经度及 E/W、定位质量；完整 PVT 还要求海拔及单位 `M`、大地水准面差及单位 `M`。卫星数和 HDOP 可选。 | 用于 NTRIP 上报位置。完整 PVT 还要求有效坐标、时间和上述高度字段；缺少高度或大地水准面差时仍可上报 GGA，但不发布 PVT。 |
+| `RMC` | 必需；10 Hz | 必须有 UTC 时间和日期；状态、地面速度（节）、航迹角（度）用于速度输出。 | 提供 PVT 日期和速度。速度或航迹角为空时按零处理；状态不是 `A` 时速度按零处理。 |
+| `GSA` | 建议；1 Hz | 定位类型 `mode_fix_type`（1/2/3）和 PDOP。首个 `A/M` 字段表示自动/手动模式，不是 2D/3D 定位类型。 | 提供 `fix_type` 和 PDOP；报文缺失时分别使用 3 和 `0.0`。 |
+| `GST` | 建议；10 Hz | 纬度误差、经度误差、海拔误差，误差单位为米。 | 纬度和经度误差合成为水平精度，海拔误差作为垂直精度；字段为空或未及时收到 GST 时相应精度为 `0.0`。 |
+
+`GGA` 和带日期的 `RMC` 是发布 PVT 的必要输入；`GSA`、`GST` 用于提供额外定位状态和精度。接收机必须在同一 UART 输出 GGA、RMC；建议同时开启 GSA、GST。节点不会通过串口配置命令替接收机开启报文。
 
 Linux 下运行节点的用户必须有串口设备的读写权限。先检查设备属组和当前用户组：
 
@@ -74,41 +87,42 @@ ros2 run ntrip_gnss_relay ntrip_gnss_relay \
   --mount YOUR_MOUNTPOINT \
   --username YOUR_USERNAME \
   --ros-args \
-  -r /ublox_driver/receiver_pvt:=/robot/gnss/receiver_pvt
+  -r /gnss/pvt:=/ublox_driver/receiver_pvt
 ```
 
 `caster.example.com` 和 `YOUR_MOUNTPOINT` 是占位示例，需替换为实际服务参数。未设置密码时会交互询问；非交互运行需配置 `NTRIP_USER` 和 `NTRIP_PASSWORD`。凭据使用 TCP Basic Authentication，当前不支持 TLS。
+FAST-LIVO2-RTK 当前配置默认订阅 `/ublox_driver/receiver_pvt`，上面的重映射可直接连接该订阅；其他消费者可使用通用默认话题 `/gnss/pvt`。
 
 配置优先级：命令行参数 > 已有环境变量 > `.env` > 程序默认值。服务器和挂载点没有预设值，必须配置；端口默认 `2101`，支持 `1`～`65535`，不约定端口与坐标框架的关系。密码只通过 `.env`、环境变量或交互提示提供。
 
-| 参数 | 环境变量 / `.env` 键 | 默认值 |
-|---|---|---|
-| `--env-file` | — | 脚本所在目录的 `.env` |
-| `--serial` | `SERIAL_DEVICE` | 必填 |
-| `--baud` | `SERIAL_BAUD` | `115200` |
-| `--host` | `NTRIP_HOST` | 必填 |
-| `--caster-port` | `NTRIP_PORT` | `2101` |
-| `--mount` | `NTRIP_MOUNT` | 必填 |
-| `--username` | `NTRIP_USER` | 交互询问 |
-| 密码 | `NTRIP_PASSWORD` | 交互询问 |
-| `--gga-interval` | — | `5` 秒 |
-| `--gga-timeout` | — | `15` 秒 |
-| `--connect-timeout` | — | `10` 秒 |
-| `--rtcm-timeout` | — | `15` 秒 |
-| `--verbose` | — | 关闭 |
+| 参数                  | 环境变量 /`.env` 键 | 默认值                 |
+| --------------------- | --------------------- | ---------------------- |
+| `--env-file`        | —                    | 脚本所在目录的`.env` |
+| `--serial`          | `SERIAL_DEVICE`     | 必填                   |
+| `--baud`            | `SERIAL_BAUD`       | `115200`             |
+| `--host`            | `NTRIP_HOST`        | 必填                   |
+| `--caster-port`     | `NTRIP_PORT`        | `2101`               |
+| `--mount`           | `NTRIP_MOUNT`       | 必填                   |
+| `--username`        | `NTRIP_USER`        | 交互询问               |
+| 密码                  | `NTRIP_PASSWORD`    | 交互询问               |
+| `--gga-interval`    | —                    | `5` 秒               |
+| `--gga-timeout`     | —                    | `15` 秒              |
+| `--connect-timeout` | —                    | `10` 秒              |
+| `--rtcm-timeout`    | —                    | `15` 秒              |
+| `--verbose`         | —                    | 关闭                   |
 
 ## ROS 2 话题
 
-节点校验 GGA、GSA、GST 和 RMC，并将有效定位转为 `gnss_comm/msg/GnssPVTSolnMsg`，默认发布到 `/ublox_driver/receiver_pvt`，可通过 ROS 参数重映射。话题采用可靠 QoS，与 FAST-LIVO2-RTK 默认订阅配置匹配。UTC 日期和速度取自最近的有效 RMC，GGA UTC 作为定位历元；GPS 周和周内秒按 18 秒 GPS-UTC 闰秒差换算。椭球高由 GGA 海拔（MSL）加大地水准面差得到，因此仅在这两个字段均以米提供且 RMC 日期可用时发布。`fix_type` 使用 GSA 的 2D/3D 模式，差分与载波状态使用 GGA 定位质量，DOP 来自 GSA，水平/垂直精度来自 GST。未收到 GST 精度时 `h_acc` 和 `v_acc` 为 `0.0`；RMC 无效时速度为零。无效定位不会发布 PVT，避免下游将无效坐标用于初始化。
+节点校验 GGA、GSA、GST 和 RMC，并将有效定位转为 `gnss_comm/msg/GnssPVTSolnMsg`，默认发布到通用话题 `/gnss/pvt`，可通过 ROS 话题重映射接入其他消费者。话题采用可靠 QoS。FAST-LIVO2-RTK 当前默认订阅 `/ublox_driver/receiver_pvt`，可将 `/gnss/pvt` 重映射到该名称。UTC 日期和速度取自最近的有效 RMC，GGA UTC 作为定位历元；GPS 周和周内秒按 18 秒 GPS-UTC 闰秒差换算。椭球高由 GGA 海拔（MSL）加大地水准面差得到，因此仅在这两个字段均以米提供且 RMC 日期可用时发布。`fix_type` 使用 GSA 的 2D/3D 模式，差分与载波状态使用 GGA 定位质量，DOP 来自 GSA，水平/垂直精度来自 GST。未收到 GST 精度时 `h_acc` 和 `v_acc` 为 `0.0`；RMC 无效时速度为零。无效定位不会发布 PVT，避免下游将无效坐标用于初始化。
 
-| 话题 | 类型 / 来源 | 频率 |
-|---|---|---:|
-| `/ublox_driver/receiver_pvt` | `gnss_comm/msg/GnssPVTSolnMsg` | 最多 10 Hz |
+| 话题                           | 类型 / 来源                      |       频率 |
+| ------------------------------ | -------------------------------- | ---------: |
+| `/gnss/pvt` | `gnss_comm/msg/GnssPVTSolnMsg` | 最多 10 Hz |
 
 无效、无定位或不完整的 GGA 不会发布 PVT；校验失败或格式错误的辅助 NMEA 报文会被忽略。
 
 ```bash
-ros2 topic echo /ublox_driver/receiver_pvt gnss_comm/msg/GnssPVTSolnMsg
+ros2 topic echo /gnss/pvt gnss_comm/msg/GnssPVTSolnMsg
 ```
 
 ## 定位状态与恢复
@@ -140,15 +154,15 @@ $GNGGA,,,,,,0,,,,,,,,*78
 
 ## 常见问题
 
-| 现象 | 检查项 |
-|---|---|
-| 串口打不开 | 设备路径、USB 连接、用户串口权限 |
-| 一直等待 GGA | TX/RX 接线、波特率、接收机 GGA 输出配置 |
-| quality=0 | 天线连接、供电、天空可见性 |
-| 定位历元未推进 | 接收机 UTC 输出，是否反复发送同一报文 |
-| 401/403 或挂载点错误 | 账号有效期、密码、挂载点名称和授权 |
-| RTCM 超时 | 网络、服务状态、位置覆盖和实际数据周期 |
-| 有差分但没有 FIX | 串口 RTCM 输入、支持的消息、信号质量和差分龄期 |
+| 现象                 | 检查项                                         |
+| -------------------- | ---------------------------------------------- |
+| 串口打不开           | 设备路径、USB 连接、用户串口权限               |
+| 一直等待 GGA         | TX/RX 接线、波特率、接收机 GGA 输出配置        |
+| quality=0            | 天线连接、供电、天空可见性                     |
+| 定位历元未推进       | 接收机 UTC 输出，是否反复发送同一报文          |
+| 401/403 或挂载点错误 | 账号有效期、密码、挂载点名称和授权             |
+| RTCM 超时            | 网络、服务状态、位置覆盖和实际数据周期         |
+| 有差分但没有 FIX     | 串口 RTCM 输入、支持的消息、信号质量和差分龄期 |
 
 可添加 `--verbose` 查看 GGA 原始报文和调试日志。测试时保持一个程序读取串口，避免争抢数据。
 
