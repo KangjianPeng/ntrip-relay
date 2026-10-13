@@ -11,12 +11,15 @@ import math
 import os
 import re
 import socket
+import sys
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, time as utc_time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
+from datetime import time as utc_time
 from pathlib import Path
+from typing import Union
 
 import pynmea2
 import serial
@@ -112,7 +115,7 @@ class GstData:
     v_acc: float
 
 
-AuxiliaryNmea = RmcData | GsaData | GstData
+AuxiliaryNmea = Union[RmcData, GsaData, GstData]
 
 
 def _valid_coordinate(raw: str, direction: str, limit: int) -> bool:
@@ -241,6 +244,7 @@ class GgaReader:
         stale_after: float,
         on_gga: Callable[[GgaData], None] | None = None,
         on_auxiliary_nmea: Callable[[AuxiliaryNmea], None] | None = None,
+        shutdown_event: threading.Event | None = None,
     ):
         self.serial_port = serial_port
         self.stale_after = stale_after
@@ -257,14 +261,13 @@ class GgaReader:
         self._epoch_changed_at: float | None = None
         self.on_gga = on_gga
         self.on_auxiliary_nmea = on_auxiliary_nmea
+        self.shutdown_event = shutdown_event
         self._last_callback_error: float | None = None
         self._last_auxiliary_callback_error: float | None = None
 
     def __enter__(self):
         self._discard_backlog()
-        self._thread = threading.Thread(
-            target=self._run, name="gnss-nmea", daemon=True
-        )
+        self._thread = threading.Thread(target=self._run, name="gnss-nmea", daemon=True)
         self._thread.start()
         return self
 
@@ -289,7 +292,7 @@ class GgaReader:
     def _run(self) -> None:
         last_poll = time.monotonic()
         try:
-            while not self._stop.is_set():
+            while not self.should_stop():
                 now = time.monotonic()
                 if now - last_poll > self.stale_after:
                     LOG.warning("串口读取曾暂停过久，丢弃积压数据并等待新 GGA")
@@ -387,9 +390,7 @@ class GgaReader:
                             LOG.exception("处理接收机辅助 NMEA 数据失败")
                             self._last_auxiliary_callback_error = now
                 continue
-            LOG.debug(
-                "忽略不支持的 NMEA 或校验/格式错误的串口报文：%r", line[:160]
-            )
+            LOG.debug("忽略不支持的 NMEA 或校验/格式错误的串口报文：%r", line[:160])
 
         # Recover from garbage or incomplete oversized sentences on the UART.
         if len(self.buffer) > 8192:
@@ -433,54 +434,43 @@ class GgaReader:
     def is_fresh(self) -> bool:
         return self.get_latest() is not None
 
-    def wait_for_fix(self) -> bytes:
+    def wait_for_fix(self) -> bool:
         last_notice = 0.0
-        while True:
-            gga = self.get_latest()
-            if gga is not None:
-                return gga
+        while not self.should_stop():
+            if self.get_latest() is not None:
+                return True
             now = time.monotonic()
             if now - last_notice >= 5:
                 LOG.info("等待接收机的真实有效 GGA；单点定位即可请求 RTCM")
                 last_notice = now
             self._stop.wait(0.1)
+        return False
+
+    def should_stop(self) -> bool:
+        return self._stop.is_set() or (
+            self.shutdown_event is not None and self.shutdown_event.is_set()
+        )
 
 
-class Ros2PvtPublisher:
+class Ros1PvtPublisher:
     """Publish GNSS PVT solutions assembled from checked NMEA sentences."""
 
     topic = PVT_TOPIC
 
     def __init__(self, ros_args: list[str]):
         try:
-            import rclpy
+            import rospy
             from gnss_comm.msg import GnssPVTSolnMsg
-            from rclpy.executors import SingleThreadedExecutor
-            from rclpy.node import Node
-            from rclpy.qos import QoSProfile, ReliabilityPolicy
-            from rclpy.signals import SignalHandlerOptions
         except ImportError as exc:
-            raise RuntimeError(
-                "需要先安装并加载 ROS 2、rclpy 和 gnss_comm"
-            ) from exc
+            raise RuntimeError("需要先安装并加载 ROS 1、rospy 和 gnss_comm") from exc
 
-        self.rclpy = rclpy
         self.GnssPVTSolnMsg = GnssPVTSolnMsg
-        self.owns_context = not rclpy.ok()
-        if self.owns_context:
-            rclpy.init(
-                args=ros_args,
-                signal_handler_options=SignalHandlerOptions.NO,
-            )
-        self.node = Node("ntrip_gnss_relay")
-        self.pvt_publisher = self.node.create_publisher(
-            GnssPVTSolnMsg,
-            self.topic,
-            QoSProfile(
-                depth=2000,
-                reliability=ReliabilityPolicy.RELIABLE,
-            ),
+        self.stop_event = threading.Event()
+        rospy.init_node(
+            "ntrip_gnss_relay",
+            argv=[sys.argv[0], *ros_args],
         )
+        self.pvt_publisher = rospy.Publisher(self.topic, GnssPVTSolnMsg, queue_size=10)
         self._latest_rmc: tuple[datetime, float, float, bool] | None = None
         self._latest_rmc_received_at: float | None = None
         self._latest_gsa: tuple[int, float] | None = None
@@ -488,12 +478,7 @@ class Ros2PvtPublisher:
         self._latest_gst: tuple[float, float] | None = None
         self._latest_gst_received_at: float | None = None
         self._pending_gga: tuple[GgaData, float] | None = None
-        self.executor = SingleThreadedExecutor()
-        self.executor.add_node(self.node)
-        self._thread = threading.Thread(
-            target=self.executor.spin, name="ros2-pvt", daemon=True
-        )
-        self._thread.start()
+        rospy.on_shutdown(self.stop_event.set)
 
     def publish(self, gga: GgaData) -> None:
         now = time.monotonic()
@@ -532,6 +517,10 @@ class Ros2PvtPublisher:
         ):
             return False
 
+        has_recent_gsa = self._has_recent_gsa(now)
+        if has_recent_gsa and self._latest_gsa[0] == 1:
+            return False
+
         rmc_time, speed, course, rmc_valid = self._latest_rmc
         try:
             gga_time = utc_time.fromisoformat(gga.time_utc)
@@ -552,11 +541,7 @@ class Ros2PvtPublisher:
         msg = self.GnssPVTSolnMsg()
         msg.time.week = int(week)
         msg.time.tow = tow
-        msg.fix_type = (
-            2
-            if self._has_recent_gsa(now) and self._latest_gsa[0] == 2
-            else 3
-        )
+        msg.fix_type = 2 if has_recent_gsa and self._latest_gsa[0] == 2 else 3
         msg.valid_fix = True
         msg.diff_soln = gga.quality in (2, 4, 5)
         msg.carr_soln = {4: 2, 5: 1}.get(gga.quality, 0)
@@ -565,7 +550,7 @@ class Ros2PvtPublisher:
         msg.longitude = gga.longitude
         msg.altitude = gga.altitude_m + gga.geoid_separation_m
         msg.height_msl = gga.altitude_m
-        msg.p_dop = self._latest_gsa[1] if self._has_recent_gsa(now) else 0.0
+        msg.p_dop = self._latest_gsa[1] if has_recent_gsa else 0.0
         msg.h_acc, msg.v_acc = (
             self._latest_gst if self._has_recent_gst(now) else (0.0, 0.0)
         )
@@ -593,11 +578,8 @@ class Ros2PvtPublisher:
         )
 
     def close(self) -> None:
-        self.executor.shutdown()
-        self._thread.join()
-        self.node.destroy_node()
-        if self.owns_context and self.rclpy.ok():
-            self.rclpy.shutdown()
+        self.stop_event.set()
+        self.pvt_publisher.unregister()
 
 
 def _check_ntrip_status(status: bytes) -> int | None:
@@ -700,7 +682,8 @@ def relay_session(
     gga_reader: GgaReader,
     on_data: Callable[[], None] | None = None,
 ) -> None:
-    gga_reader.wait_for_fix()
+    if not gga_reader.wait_for_fix():
+        return
     sock, pending = connect_mount(
         args.host,
         args.caster_port,
@@ -735,7 +718,7 @@ def relay_session(
                 on_data()
             recovered = True
 
-        while True:
+        while not gga_reader.should_stop():
             now = time.monotonic()
             gga = gga_reader.get_latest()
             if gga is None:
@@ -786,6 +769,7 @@ def run_relay(
     password: str,
     on_gga: Callable[[GgaData], None] | None = None,
     on_auxiliary_nmea: Callable[[AuxiliaryNmea], None] | None = None,
+    shutdown_event: threading.Event | None = None,
 ) -> int:
     """Keep reading through network retries; reopen the UART after serial faults."""
 
@@ -796,7 +780,13 @@ def run_relay(
         network_backoff.reset()
         serial_backoff.reset()
 
-    while True:
+    def wait_backoff(delay: float) -> None:
+        if shutdown_event is None:
+            time.sleep(delay)
+        else:
+            shutdown_event.wait(delay)
+
+    while shutdown_event is None or not shutdown_event.is_set():
         try:
             with serial.Serial(
                 args.serial,
@@ -813,8 +803,9 @@ def run_relay(
                     args.gga_timeout,
                     on_gga=on_gga,
                     on_auxiliary_nmea=on_auxiliary_nmea,
+                    shutdown_event=shutdown_event,
                 ) as gga_reader:
-                    while True:
+                    while not gga_reader.should_stop():
                         try:
                             relay_session(
                                 args,
@@ -829,14 +820,15 @@ def run_relay(
                         except (OSError, RelayError) as exc:
                             delay = network_backoff.next_delay()
                             LOG.warning("NTRIP 中断：%s；%.0f 秒后重试", exc, delay)
-                            time.sleep(delay)
+                            wait_backoff(delay)
         except NtripConfigurationError as exc:
             LOG.error("%s；请修正配置后重新运行", exc)
             return 2
         except (SerialLinkError, serial.SerialException, OSError) as exc:
             delay = serial_backoff.next_delay()
             LOG.warning("串口故障：%s；%.0f 秒后重新打开 %s", exc, delay, args.serial)
-            time.sleep(delay)
+            wait_backoff(delay)
+    return 0
 
 
 def parse_args(argv=None):
@@ -955,9 +947,9 @@ def main(argv=None) -> int:
         return 2
 
     try:
-        pvt_publisher = Ros2PvtPublisher(args.ros_args)
+        pvt_publisher = Ros1PvtPublisher(args.ros_args)
     except (ImportError, RuntimeError) as exc:
-        LOG.error("无法启动 ROS 2 GNSS 发布：%s", exc)
+        LOG.error("无法启动 ROS 1 GNSS 发布：%s", exc)
         return 2
 
     try:
@@ -967,6 +959,7 @@ def main(argv=None) -> int:
             password,
             on_gga=pvt_publisher.publish,
             on_auxiliary_nmea=pvt_publisher.update_auxiliary,
+            shutdown_event=pvt_publisher.stop_event,
         )
     except KeyboardInterrupt:
         LOG.info("已停止")

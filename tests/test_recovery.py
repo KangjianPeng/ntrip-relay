@@ -48,7 +48,7 @@ class FreshReader:
     updated_at = 0.0
 
     def wait_for_fix(self):
-        return POSITION
+        return True
 
     def get_latest(self):
         return POSITION
@@ -369,9 +369,8 @@ class RecoveryLoopTests(unittest.TestCase):
             "Serial",
             side_effect=[serial.SerialException("not present"), MagicMock()],
         ) as opened:
-            with (
-                patch.object(relay, "GgaReader"),
-                patch.object(relay, "relay_session", side_effect=KeyboardInterrupt),
+            with patch.object(relay, "GgaReader"), patch.object(
+                relay, "relay_session", side_effect=KeyboardInterrupt
             ):
                 with patch.object(relay.time, "sleep") as sleep:
                     with self.assertRaises(KeyboardInterrupt):

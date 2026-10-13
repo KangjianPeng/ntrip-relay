@@ -1,17 +1,16 @@
 <?xml version="1.0"?>
-<package format="3">
+<package format="2">
   <name>ntrip_gnss_relay</name>
   <version>0.1.0</version>
-  <description>Forward NTRIP RTCM corrections and publish GNSS PVT solutions to ROS 2.</description>
+  <description>Forward NTRIP RTCM corrections and publish GNSS PVT solutions to ROS 1.</description>
   <maintainer email="pkjinfinity@outlook.com">Kangjian Peng</maintainer>
   <license>MIT</license>
 
-  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>catkin</buildtool_depend>
 
-  <exec_depend>rclpy</exec_depend>
-  <exec_depend>gnss_comm</exec_depend>
-
-  <export>
-    <build_type>ament_cmake</build_type>
-  </export>
+  <depend>rospy</depend>
+  <depend>gnss_comm</depend>
+  <exec_depend>python3-serial</exec_depend>
+  <exec_depend>python3-pynmea2</exec_depend>
+  <exec_depend>python3-dotenv</exec_depend>
 </package>

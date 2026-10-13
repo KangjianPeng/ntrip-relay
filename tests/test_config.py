@@ -157,13 +157,11 @@ class EnvConfigTests(unittest.TestCase):
             "NTRIP_USER=test-user\nNTRIP_PASSWORD=test-password\n"
         )
         publisher = MagicMock()
-        with (
-            patch.object(relay, "run_relay", return_value=0) as run,
-            patch.object(relay, "Ros2PvtPublisher", return_value=publisher) as ros,
-            patch.object(relay.logging, "basicConfig"),
-            patch("builtins.input") as prompt,
-            patch.object(relay.getpass, "getpass") as password_prompt,
-        ):
+        with patch.object(relay, "run_relay", return_value=0) as run, patch.object(
+            relay, "Ros1PvtPublisher", return_value=publisher
+        ) as ros, patch.object(relay.logging, "basicConfig"), patch(
+            "builtins.input"
+        ) as prompt, patch.object(relay.getpass, "getpass") as password_prompt:
             self.assertEqual(relay.main(["--env-file", str(self.config)]), 0)
         self.assertEqual(run.call_args.args[1:], ("test-user", "test-password"))
         self.assertEqual(run.call_args.kwargs["on_gga"], publisher.publish)
