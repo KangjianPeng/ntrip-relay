@@ -15,7 +15,7 @@
 - 按接收机手册配置同一 UART 输出带校验和的 NMEA GGA（10 Hz）和 RMC（10 Hz）；建议同时输出 GSA（1 Hz）与 GST（10 Hz），并接受服务返回的 RTCM 消息。脚本不会发送厂商专用配置命令，也不会更改接收机输出频率。
 - 接收机与脚本波特率一致；适配器的电平必须兼容接收机 UART，不能直接混接 TTL 与 RS-232。
 - 接收机需要连接 GNSS 天线，并获得真实定位。单点定位即可开始请求差分，无需预先取得 RTK FIX。
-- Linux 可用 `ls -l /dev/serial/by-id/` 查找设备，长期运行建议使用稳定的 `by-id` 或 `by-path` 路径。Windows 可使用 `COM3` 等名称。
+- Linux 可用 `ls -l /dev/serial/by-id/` 查找设备，长期运行建议使用稳定的 `by-id` 或 `by-path` 路径。
 
 ### NMEA 0183 输出字段
 
@@ -47,24 +47,25 @@ sudo usermod -aG dialout "$USER"
 
 ## ROS 2 安装与运行
 
-需要已安装的 ROS 2、`colcon`、`rosdep`、`uv`、可访问 CORS 服务商的网络，以及串口读写权限。
+需要已安装的 ROS 2、`colcon`、`rosdep`、可访问 CORS 服务商的网络，以及串口读写权限。Python 运行依赖由 `package.xml` 声明并通过 `rosdep` 安装，无需使用 `uv` 或创建虚拟环境。
 
 ```bash
-source /opt/ros/$ROS_DISTRO/setup.bash
+sudo apt install python3-colcon-common-extensions python3-rosdep
+sudo rosdep init  # 仅首次初始化时运行；已初始化则跳过
+rosdep update
+ros_distro=humble  # 按已安装版本修改，例如 jazzy
+source "/opt/ros/${ros_distro}/setup.bash"
 mkdir -p ~/ros2_ws/src
 cd ~/ros2_ws/src
-git clone https://github.com/KangjianPeng/ntrip-relay.git
+git clone --branch ros2 https://github.com/KangjianPeng/ntrip-relay.git
 git clone --branch humble https://github.com/KangjianPeng/gnss_comm.git
 cd ntrip-relay
-uv venv --system-site-packages --python /usr/bin/python3
-uv sync --locked
 cp .env.example .env
 chmod 600 .env
 cd ~/ros2_ws
-rosdep install --from-paths src --ignore-src -r -y
-colcon build --packages-select gnss_comm ntrip_gnss_relay
+rosdep install --from-paths src --ignore-src --rosdistro "$ros_distro" -r -y
+colcon build --packages-up-to ntrip_gnss_relay
 source install/setup.bash
-source src/ntrip-relay/.venv/bin/activate
 ```
 
 编辑 `src/ntrip-relay/.env`，填写串口和 CORS 服务商提供的连接参数、账号密码，然后启动节点：
@@ -74,9 +75,9 @@ ros2 run ntrip_gnss_relay ntrip_gnss_relay \
   --env-file "$HOME/ros2_ws/src/ntrip-relay/.env"
 ```
 
-本项目是 `ament_cmake` ROS 2 包。CMake 安装 Python 入口为 `ntrip_gnss_relay`；虚拟环境启用系统 site-packages，以便访问 ROS 2 的 `rclpy` 和 `gnss_comm`。构建并 source 提供 `gnss_comm/msg/GnssPVTSolnMsg` 的 ROS 2 工作空间后再启动节点。Python 依赖包括 `pyserial`、`pynmea2` 和 `python-dotenv`。
+本项目是 `ament_cmake` ROS 2 包。CMake 安装 Python 入口为 `ntrip_gnss_relay`。`rosdep install` 会根据 `package.xml` 安装 `rclpy`、`gnss_comm`、`pyserial`、`pynmea2` 和 `python-dotenv`。构建并 source 提供 `gnss_comm/msg/GnssPVTSolnMsg` 的 ROS 2 工作空间后再启动节点。
 
-默认读取脚本所在目录的 `.env`，可通过 `--env-file /path/to/.env` 指定其他配置文件。也可以在启动时覆盖配置：
+节点默认读取已安装脚本旁边的 `.env`。由于 colcon 将入口安装到 `install/lib/ntrip_gnss_relay/`，而配置文件通常保存在 `src/ntrip-relay/`，因此运行时需像上面的命令一样显式传入 `--env-file`。也可通过该参数指定其他配置文件。命令行参数仍可覆盖配置：
 
 ```bash
 ros2 run ntrip_gnss_relay ntrip_gnss_relay \
@@ -121,6 +122,8 @@ FAST-LIVO2-RTK 当前配置默认订阅 `/ublox_driver/receiver_pvt`，上面的
 
 无效、无定位或不完整的 GGA 不会发布 PVT；校验失败或格式错误的辅助 NMEA 报文会被忽略。
 
+节点会在启动终端输出串口、定位、PVT 发布和 CORS/NTRIP 响应状态；日志不会显示鉴权凭据。`--verbose` 会额外显示调试信息和原始 GGA。
+
 ```bash
 ros2 topic echo /gnss/pvt gnss_comm/msg/GnssPVTSolnMsg
 ```
@@ -163,6 +166,7 @@ $GNGGA,,,,,,0,,,,,,,,*78
 | 401/403 或挂载点错误 | 账号有效期、密码、挂载点名称和授权             |
 | RTCM 超时            | 网络、服务状态、位置覆盖和实际数据周期         |
 | 有差分但没有 FIX     | 串口 RTCM 输入、支持的消息、信号质量和差分龄期 |
+| `GnssPVTSolnMsg` 字段 AttributeError | 检查 `ros2 interface show gnss_comm/msg/GnssPVTSolnMsg` 是否包含 `latitude`，并确认 `ros2 pkg prefix gnss_comm` 指向预期工作空间；重新构建并 source 工作空间。节点启动日志会显示实际加载的脚本和消息定义路径 |
 
 可添加 `--verbose` 查看 GGA 原始报文和调试日志。测试时保持一个程序读取串口，避免争抢数据。
 
@@ -172,19 +176,17 @@ $GNGGA,,,,,,0,,,,,,,,*78
 ntrip_gnss_relay.py              NMEA 接收解析、ROS 2 发布、NTRIP 转发与恢复
 CMakeLists.txt / package.xml    ROS 2 包构建和运行依赖
 .env.example               不含凭据的配置模板
-pyproject.toml / uv.lock    Python 依赖和锁定版本
+pyproject.toml              Ruff 检查规则
 tests/test_config.py       配置优先级、通用端口和挂载点验证
 tests/test_gga.py          GGA 与定位状态验证
 tests/test_recovery.py     断线恢复、协议响应、TCP/伪终端集成测试
 ```
 
 ```bash
-uv sync --locked
-uv run python -m unittest discover -s tests -v
-uv run python -m py_compile ntrip_gnss_relay.py
-uv lock --check
-uvx ruff check ntrip_gnss_relay.py tests
-uvx ruff format --check ntrip_gnss_relay.py tests
+python3 -m unittest discover -s tests -v
+python3 -m py_compile ntrip_gnss_relay.py
+ruff check ntrip_gnss_relay.py tests
+ruff format --check ntrip_gnss_relay.py tests
 ```
 
 测试使用隔离样例、本机 TCP 服务和模拟串口，不连接实际差分账号。TCP/伪终端集成测试仅在 POSIX 系统运行。
