@@ -21,12 +21,12 @@
 
 报文需包含正确校验和；`GP`、`GN` 等 talker ID 均可。下表列出节点需要的报文和读取字段：
 
-| 报文 | 必需程度 / 建议频率 | 节点使用的字段 | 用途及缺失行为 |
-| --- | --- | --- | --- |
-| `GGA` | 必需；10 Hz | UTC 时间、纬度及 N/S、经度及 E/W、定位质量；完整 PVT 还要求海拔及单位 `M`、大地水准面差及单位 `M`。卫星数和 HDOP 可选。 | 用于 NTRIP 上报位置。缺少高度或大地水准面差时仍可上报 GGA，但不发布 PVT。 |
-| `RMC` | 必需；10 Hz | UTC 时间和日期；状态、地面速度（节）、航迹角（度）用于速度输出。 | 提供 PVT 日期和速度。速度或航迹角为空时按零处理；状态不是 `A` 时速度按零处理。 |
-| `GSA` | 建议；1 Hz | 定位类型 `mode_fix_type`（1/2/3）和 PDOP。首个 `A/M` 字段表示自动/手动模式，不是 2D/3D 定位类型。 | 提供 `fix_type` 和 PDOP；报文缺失时分别使用 3 和 `0.0`。近期 GSA 报告 1（无定位）时不发布 PVT。 |
-| `GST` | 建议；10 Hz | 纬度、经度和海拔误差，单位为米。 | 纬度和经度误差合成为水平精度，海拔误差作为垂直精度；字段为空或未及时收到 GST 时相应精度为 `0.0`。 |
+| 报文    | 必需程度 / 建议频率 | 节点使用的字段                                                                                                             | 用途及缺失行为                                                                                     |
+| ------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `GGA` | 必需；10 Hz         | UTC 时间、纬度及 N/S、经度及 E/W、定位质量；完整 PVT 还要求海拔及单位`M`、大地水准面差及单位 `M`。卫星数和 HDOP 可选。 | 用于 NTRIP 上报位置。缺少高度或大地水准面差时仍可上报 GGA，但不发布 PVT。                          |
+| `RMC` | 必需；10 Hz         | UTC 时间和日期；状态、地面速度（节）、航迹角（度）用于速度输出。                                                           | 提供 PVT 日期和速度。速度或航迹角为空时按零处理；状态不是`A` 时速度按零处理。                    |
+| `GSA` | 建议；1 Hz          | 定位类型`mode_fix_type`（1/2/3）和 PDOP。首个 `A/M` 字段表示自动/手动模式，不是 2D/3D 定位类型。                       | 提供`fix_type` 和 PDOP；报文缺失时分别使用 3 和 `0.0`。近期 GSA 报告 1（无定位）时不发布 PVT。 |
+| `GST` | 建议；10 Hz         | 纬度、经度和海拔误差，单位为米。                                                                                           | 纬度和经度误差合成为水平精度，海拔误差作为垂直精度；字段为空或未及时收到 GST 时相应精度为`0.0`。 |
 
 这些报文应由同一 UART 输出；节点不会通过串口命令更改接收机配置。
 
@@ -47,37 +47,37 @@ sudo usermod -aG dialout "$USER"
 
 ## ROS 1 安装与运行
 
-本分支面向 ROS Noetic 和 Ubuntu 20.04（Python 3.8），需要 `catkin`、`rosdep`、`uv`、可访问 CORS 服务商的网络，以及串口读写权限。`gnss_comm` 使用其 ROS 1 `main` 分支。
+本分支面向 ROS Noetic 和 Ubuntu 20.04（Python 3.8），需要已安装的 ROS Noetic、`catkin`、`rosdep`、可访问 CORS 服务商的网络，以及串口读写权限。`gnss_comm` 使用其 ROS 1 `main` 分支。本分支不能在 ROS 2 环境中构建；ROS 2 用户请切换到 `ros2` 分支。
+
+从干净的 Ubuntu 20.04 开始，先配置 ROS Noetic apt 源。Noetic 已结束生命周期；首次使用 `rosdep` 时初始化一次，更新规则时包含 EOL 发行版：
 
 ```bash
+sudo apt install ros-noetic-ros-base ros-noetic-rospy python3-rosdep libeigen3-dev libgoogle-glog-dev
+sudo rosdep init  # 仅首次初始化时运行；已初始化则跳过
+rosdep update --include-eol-distros --rosdistro noetic
 source /opt/ros/noetic/setup.bash
 mkdir -p ~/catkin_ws/src
 cd ~/catkin_ws/src
 git clone --branch ros1 https://github.com/KangjianPeng/ntrip-relay.git
 git clone --branch main https://github.com/KangjianPeng/gnss_comm.git
-sudo apt install libeigen3-dev libgoogle-glog-dev
 cd ntrip-relay
-uv venv --system-site-packages --python /usr/bin/python3
-uv sync --locked
 cp .env.example .env
 chmod 600 .env
 cd ~/catkin_ws
-rosdep install --from-paths src --ignore-src -r -y
+rosdep install --from-paths src --ignore-src --rosdistro noetic -r -y
 catkin_make
 source devel/setup.bash
-source src/ntrip-relay/.venv/bin/activate
 ```
 
-编辑 `src/ntrip-relay/.env` 填写串口和 CORS 服务商提供的连接参数、账号密码；先在一个终端运行 `roscore`，再在另一个已 source 工作空间并激活虚拟环境的终端运行节点：
+编辑 `src/ntrip-relay/.env` 填写串口和 CORS 服务商提供的连接参数、账号密码；先在一个终端运行 `roscore`，再在另一个已 source ROS Noetic 和工作空间的终端运行节点：
 
 ```bash
-rosrun ntrip_gnss_relay ntrip_gnss_relay.py \
-  --env-file "$HOME/catkin_ws/src/ntrip-relay/.env"
+rosrun ntrip_gnss_relay ntrip_gnss_relay.py
 ```
 
-虚拟环境需启用系统 site-packages，才能访问 ROS 安装的 `rospy` 和 `gnss_comm` 消息；Python 依赖由 `uv` 安装。
+节点默认自动读取脚本所在包目录的 `.env`，即 `src/ntrip-relay/.env`；当前工作目录不影响查找位置。需要使用其他配置文件时，再传入 `--env-file /path/to/.env`。`package.xml` 声明了 `rospy`、`gnss_comm`、`pyserial`、`pynmea2` 和 `python-dotenv` 依赖；`rosdep install` 会安装对应 ROS 与系统 Python 包。使用 ROS 自带的 Python 环境，不需要另建虚拟环境。
 
-默认读取脚本所在目录的 `.env`，可通过 `--env-file /path/to/.env` 指定其他配置文件。也可以在启动时覆盖配置：
+也可以在启动时覆盖 `.env` 中的配置：
 
 ```bash
 rosrun ntrip_gnss_relay ntrip_gnss_relay.py \
@@ -115,8 +115,8 @@ FAST-LIVO2-RTK 当前配置默认订阅 `/ublox_driver/receiver_pvt`，上面的
 
 UTC 日期和速度取自最近的有效 RMC，GGA UTC 作为定位历元；GPS 周和周内秒按 18 秒 GPS-UTC 闰秒差换算。椭球高由 GGA 海拔（MSL）加大地水准面差得到，仅在两个高度字段均以米提供且 RMC 日期可用时发布。`fix_type` 使用 GSA 的 2D/3D 模式（缺失时按 3D 处理；近期 GSA 报告无定位时不发布）；差分与载波状态取自 GGA 定位质量，DOP 来自 GSA，水平/垂直精度来自 GST。未收到 GST 精度时 `h_acc` 和 `v_acc` 为 `0.0`；RMC 无效时速度为零。无效定位不会发布 PVT，避免下游将无效坐标用于初始化。
 
-| 话题          | 类型 / 来源                      |       频率 |
-| ------------- | -------------------------------- | ---------: |
+| 话题          | 类型 / 来源                  |       频率 |
+| ------------- | ---------------------------- | ---------: |
 | `/gnss/pvt` | `gnss_comm/GnssPVTSolnMsg` | 最多 10 Hz |
 
 校验失败或格式错误的辅助 NMEA 报文会被忽略。
@@ -124,6 +124,8 @@ UTC 日期和速度取自最近的有效 RMC，GGA UTC 作为定位历元；GPS 
 ```bash
 rostopic echo /gnss/pvt
 ```
+
+节点会在启动终端输出串口、定位、PVT 发布和 CORS/NTRIP 响应状态；日志不会显示鉴权凭据。`--verbose` 会额外显示调试信息和原始 GGA。
 
 ## 定位状态与恢复
 
@@ -154,15 +156,17 @@ $GNGGA,,,,,,0,,,,,,,,*78
 
 ## 常见问题
 
-| 现象                 | 检查项                                         |
-| -------------------- | ---------------------------------------------- |
-| 串口打不开           | 设备路径、USB 连接、用户串口权限               |
-| 一直等待 GGA         | TX/RX 接线、波特率、接收机 GGA 输出配置        |
-| quality=0            | 天线连接、供电、天空可见性                     |
-| 定位历元未推进       | 接收机 UTC 输出，是否反复发送同一报文          |
-| 401/403 或挂载点错误 | 账号有效期、密码、挂载点名称和授权             |
-| RTCM 超时            | 网络、服务状态、位置覆盖和实际数据周期         |
-| 有差分但没有 FIX     | 串口 RTCM 输入、支持的消息、信号质量和差分龄期 |
+| 现象                             | 检查项                                                                                                                     |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| 串口打不开                       | 设备路径、USB 连接、用户串口权限                                                                                           |
+| 一直等待 GGA                     | TX/RX 接线、波特率、接收机 GGA 输出配置                                                                                    |
+| quality=0                        | 天线连接、供电、天空可见性                                                                                                 |
+| 定位历元未推进                   | 接收机 UTC 输出，是否反复发送同一报文                                                                                      |
+| 401/403 或挂载点错误             | 账号有效期、密码、挂载点名称和授权                                                                                         |
+| RTCM 超时                        | 网络、服务状态、位置覆盖和实际数据周期                                                                                     |
+| 有差分但没有 FIX                 | 串口 RTCM 输入、支持的消息、信号质量和差分龄期                                                                             |
+| `catkin_make` 找不到 `rospy` | 确认使用 ROS Noetic，先 source `/opt/ros/noetic/setup.bash`，并安装 `ros-noetic-rospy`；ROS 2 环境请构建 `ros2` 分支 |
+| `GnssPVTSolnMsg` 字段 AttributeError | 检查 `rosmsg show gnss_comm/GnssPVTSolnMsg` 中是否为 `latitude`，并确认 `rospack find gnss_comm` 指向当前工作空间；重新构建并 source 该工作空间。节点启动日志会显示实际加载的脚本和消息文件路径 |
 
 可添加 `--verbose` 查看 GGA 原始报文和调试日志。测试时保持一个程序读取串口，避免争抢数据。
 
@@ -172,19 +176,17 @@ $GNGGA,,,,,,0,,,,,,,,*78
 ntrip_gnss_relay.py              NMEA 接收解析、ROS 1 发布、NTRIP 转发与恢复
 CMakeLists.txt / package.xml    catkin 包构建和运行依赖
 .env.example               不含凭据的配置模板
-pyproject.toml / uv.lock    Python 依赖和锁定版本
+pyproject.toml              Ruff 检查规则
 tests/test_config.py       配置优先级、通用端口和挂载点验证
 tests/test_gga.py          GGA 与定位状态验证
 tests/test_recovery.py     断线恢复、协议响应、TCP/伪终端集成测试
 ```
 
 ```bash
-uv sync --locked
-uv run python -m unittest discover -s tests -v
-uv run python -m py_compile ntrip_gnss_relay.py
-uv lock --check
-uvx ruff check ntrip_gnss_relay.py tests
-uvx ruff format --check ntrip_gnss_relay.py tests
+python3 -m unittest discover -s tests -v
+python3 -m py_compile ntrip_gnss_relay.py
+ruff check ntrip_gnss_relay.py tests
+ruff format --check ntrip_gnss_relay.py tests
 ```
 
 测试使用隔离样例、本机 TCP 服务和模拟串口，不连接实际差分账号。TCP/伪终端集成测试仅在 POSIX 系统运行。

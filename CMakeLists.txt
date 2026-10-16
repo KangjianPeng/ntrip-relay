@@ -1,14 +1,9 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(ntrip_gnss_relay)
 
-find_package(catkin REQUIRED COMPONENTS
-  gnss_comm
-  rospy
-)
+find_package(catkin REQUIRED)
 
-catkin_package(
-  CATKIN_DEPENDS gnss_comm rospy
-)
+catkin_package()
 
 catkin_install_python(
   PROGRAMS ntrip_gnss_relay.py
