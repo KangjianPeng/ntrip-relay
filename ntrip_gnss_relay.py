@@ -11,6 +11,7 @@ import math
 import os
 import re
 import socket
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -68,6 +69,20 @@ GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc)
 GPS_UTC_LEAP_SECONDS = 18
 SECONDS_PER_GPS_WEEK = 604800
 RMC_MAX_AGE = 5.0
+
+
+def configure_logging(verbose: bool) -> None:
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    )
+    LOG.handlers.clear()
+    LOG.addHandler(handler)
+    LOG.setLevel(logging.DEBUG if verbose else logging.INFO)
+    LOG.propagate = False
 
 
 @dataclass(frozen=True)
@@ -466,6 +481,50 @@ class Ros2PvtPublisher:
 
         self.rclpy = rclpy
         self.GnssPVTSolnMsg = GnssPVTSolnMsg
+        message = GnssPVTSolnMsg()
+        required_fields = (
+            "time",
+            "fix_type",
+            "valid_fix",
+            "diff_soln",
+            "carr_soln",
+            "num_sv",
+            "latitude",
+            "longitude",
+            "altitude",
+            "height_msl",
+            "h_acc",
+            "v_acc",
+            "p_dop",
+            "vel_n",
+            "vel_e",
+            "vel_d",
+            "vel_acc",
+        )
+        missing_fields = [
+            field for field in required_fields if not hasattr(message, field)
+        ]
+        time_message = getattr(message, "time", None)
+        missing_time_fields = not all(
+            hasattr(time_message, field) for field in ("week", "tow")
+        )
+        if missing_fields or missing_time_fields:
+            message_module = sys.modules.get(GnssPVTSolnMsg.__module__)
+            message_path = getattr(message_module, "__file__", "未知")
+            actual_fields = ", ".join(
+                field.lstrip("_") for field in getattr(message, "__slots__", ())
+            )
+            missing = list(missing_fields)
+            if missing_time_fields:
+                missing.append("time.week/time.tow")
+            raise RuntimeError(
+                "加载的 gnss_comm/msg/GnssPVTSolnMsg 消息定义不兼容："
+                f"缺少字段 {', '.join(missing)}；消息文件：{message_path}；"
+                f"实际字段：{actual_fields}"
+            )
+        message_module = sys.modules.get(GnssPVTSolnMsg.__module__)
+        message_path = getattr(message_module, "__file__", "未知")
+
         self.owns_context = not rclpy.ok()
         if self.owns_context:
             rclpy.init(
@@ -481,6 +540,12 @@ class Ros2PvtPublisher:
                 reliability=ReliabilityPolicy.RELIABLE,
             ),
         )
+        LOG.info(
+            "ROS 2 PVT 发布器已就绪：%s [%s]；消息定义：%s",
+            self.topic,
+            "gnss_comm/msg/GnssPVTSolnMsg",
+            message_path,
+        )
         self._latest_rmc: tuple[datetime, float, float, bool] | None = None
         self._latest_rmc_received_at: float | None = None
         self._latest_gsa: tuple[int, float] | None = None
@@ -488,6 +553,8 @@ class Ros2PvtPublisher:
         self._latest_gst: tuple[float, float] | None = None
         self._latest_gst_received_at: float | None = None
         self._pending_gga: tuple[GgaData, float] | None = None
+        self._last_pvt_status = ""
+        self._last_pvt_status_at = 0.0
         self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.node)
         self._thread = threading.Thread(
@@ -522,14 +589,25 @@ class Ros2PvtPublisher:
             self._latest_gst_received_at = now
 
     def _publish_pvt(self, gga: GgaData, now: float) -> bool:
+        if not gga.has_position:
+            self._log_pvt_status(now, "等待有效定位：GGA 尚无有效坐标")
+            return False
+        if gga.altitude_m is None or gga.geoid_separation_m is None:
+            self._log_pvt_status(
+                now, "等待 PVT：GGA 缺少以米为单位的海拔或大地水准面差"
+            )
+            return False
         if (
-            not gga.has_position
-            or gga.altitude_m is None
-            or gga.geoid_separation_m is None
-            or self._latest_rmc is None
+            self._latest_rmc is None
             or self._latest_rmc_received_at is None
             or now - self._latest_rmc_received_at > RMC_MAX_AGE
         ):
+            self._log_pvt_status(now, "等待 PVT：尚无 5 秒内的有效 RMC 日期和时间")
+            return False
+
+        has_recent_gsa = self._has_recent_gsa(now)
+        if has_recent_gsa and self._latest_gsa[0] == 1:
+            self._log_pvt_status(now, "等待有效定位：最近的 GSA 报告无定位")
             return False
 
         rmc_time, speed, course, rmc_valid = self._latest_rmc
@@ -552,11 +630,7 @@ class Ros2PvtPublisher:
         msg = self.GnssPVTSolnMsg()
         msg.time.week = int(week)
         msg.time.tow = tow
-        msg.fix_type = (
-            2
-            if self._has_recent_gsa(now) and self._latest_gsa[0] == 2
-            else 3
-        )
+        msg.fix_type = 2 if has_recent_gsa and self._latest_gsa[0] == 2 else 3
         msg.valid_fix = True
         msg.diff_soln = gga.quality in (2, 4, 5)
         msg.carr_soln = {4: 2, 5: 1}.get(gga.quality, 0)
@@ -565,7 +639,7 @@ class Ros2PvtPublisher:
         msg.longitude = gga.longitude
         msg.altitude = gga.altitude_m + gga.geoid_separation_m
         msg.height_msl = gga.altitude_m
-        msg.p_dop = self._latest_gsa[1] if self._has_recent_gsa(now) else 0.0
+        msg.p_dop = self._latest_gsa[1] if has_recent_gsa else 0.0
         msg.h_acc, msg.v_acc = (
             self._latest_gst if self._has_recent_gst(now) else (0.0, 0.0)
         )
@@ -576,7 +650,20 @@ class Ros2PvtPublisher:
         msg.vel_d = 0.0
         msg.vel_acc = 0.0
         self.pvt_publisher.publish(msg)
+        self._log_pvt_status(
+            now,
+            f"PVT 已发布：{FIX_NAMES[gga.quality]}，"
+            f"纬度={gga.latitude:.8f}，经度={gga.longitude:.8f}，"
+            f"椭球高={msg.altitude:.3f} m，fix_type={msg.fix_type}，"
+            f"差分={msg.diff_soln}，载波状态={msg.carr_soln}",
+        )
         return True
+
+    def _log_pvt_status(self, now: float, status: str) -> None:
+        if status != self._last_pvt_status or now - self._last_pvt_status_at >= 5.0:
+            LOG.info("%s", status)
+            self._last_pvt_status = status
+            self._last_pvt_status_at = now
 
     def _has_recent_gsa(self, now: float) -> bool:
         return (
@@ -658,6 +745,7 @@ def _read_ntrip_response(
 def connect_mount(
     host: str, port: int, mount: str, username: str, password: str, timeout: float
 ) -> tuple[socket.socket, bytes]:
+    LOG.info("正在连接 CORS/NTRIP：%s:%d/%s", host, port, mount)
     sock = socket.create_connection((host, port), timeout=timeout)
     sock.settimeout(timeout)
     token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
@@ -672,7 +760,9 @@ def connect_mount(
     ).encode("ascii")
     try:
         sock.sendall(request)
-        _, remainder = _read_ntrip_response(sock)
+        response, remainder = _read_ntrip_response(sock)
+        status = response.splitlines()[0].decode("ascii", errors="replace")
+        LOG.info("CORS/NTRIP 响应：%s", status)
         sock.settimeout(0.2)
         return sock, remainder
     except BaseException:
@@ -731,6 +821,7 @@ def relay_session(
             write_all(serial_port, pending)
             total_bytes += len(pending)
             last_rtcm_at = time.monotonic()
+            LOG.info("已收到并转发首批 RTCM：%d 字节", len(pending))
             if on_data:
                 on_data()
             recovered = True
@@ -768,6 +859,7 @@ def relay_session(
                 total_bytes += len(data)
                 last_rtcm_at = time.monotonic()
                 if not recovered:
+                    LOG.info("已收到并转发首批 RTCM：%d 字节", len(data))
                     if on_data:
                         on_data()
                     recovered = True
@@ -931,11 +1023,8 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging(args.verbose)
+    LOG.info("启动节点脚本：%s", Path(__file__).resolve())
     if any(
         not math.isfinite(value) or value <= 0
         for value in (
@@ -945,13 +1034,13 @@ def main(argv=None) -> int:
             args.rtcm_timeout,
         )
     ):
-        logging.error("时间参数必须为有限且大于 0 的数值")
+        LOG.error("时间参数必须为有限且大于 0 的数值")
         return 2
 
     username = args.username or input("NTRIP 账号: ").strip()
     password = os.getenv("NTRIP_PASSWORD") or getpass.getpass("NTRIP 密码: ")
     if not username or not password:
-        logging.error("NTRIP 账号和密码不能为空")
+        LOG.error("NTRIP 账号和密码不能为空")
         return 2
 
     try:
