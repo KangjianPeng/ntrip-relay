@@ -55,15 +55,15 @@ class RetryBackoff:
 
 
 FIX_NAMES = {
-    0: "未定位",
-    1: "单点定位",
-    2: "差分定位",
-    3: "PPS 定位",
-    4: "RTK 固定解",
-    5: "RTK 浮点解",
-    6: "推算定位",
-    7: "人工位置",
-    8: "模拟位置",
+    0: "No fix",
+    1: "Autonomous",
+    2: "Differential",
+    3: "PPS",
+    4: "RTK fixed",
+    5: "RTK float",
+    6: "Estimated",
+    7: "Manual",
+    8: "Simulation",
 }
 
 PVT_TOPIC = "/gnss/pvt"
@@ -232,9 +232,9 @@ def parse_auxiliary_nmea(value: str | bytes) -> AuxiliaryNmea | None:
                 return None
             return GsaData(mode=mode, pdop=pdop)
         if sentence_type == "GST":
-            lat_error = float(message.latitude_error or 0.0)
-            lon_error = float(message.longitude_error or 0.0)
-            alt_error = float(message.altitude_error or 0.0)
+            lat_error = float(message.std_dev_latitude or 0.0)
+            lon_error = float(message.std_dev_longitude or 0.0)
+            alt_error = float(message.std_dev_altitude or 0.0)
             if any(
                 not math.isfinite(error) or error < 0
                 for error in (lat_error, lon_error, alt_error)
@@ -245,7 +245,7 @@ def parse_auxiliary_nmea(value: str | bytes) -> AuxiliaryNmea | None:
                 v_acc=alt_error,
             )
         return None
-    except (pynmea2.ParseError, ValueError, TypeError, OverflowError):
+    except (pynmea2.ParseError, AttributeError, ValueError, TypeError, OverflowError):
         return None
 
 
@@ -266,7 +266,6 @@ class GgaReader:
         self.latest: bytes | None = None
         self.updated_at: float | None = None
         self.last_observation: GgaData | None = None
-        self.last_status_report = 0.0
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -294,7 +293,9 @@ class GgaReader:
         try:
             self.serial_port.reset_input_buffer()
         except (OSError, serial.SerialException) as exc:
-            raise SerialLinkError(f"清理串口积压数据失败：{exc}") from exc
+            raise SerialLinkError(
+                f"Failed to clear serial input buffer: {exc}"
+            ) from exc
         self.buffer.clear()
         with self._lock:
             self.latest = None
@@ -309,7 +310,7 @@ class GgaReader:
             while not self.should_stop():
                 now = time.monotonic()
                 if now - last_poll > self.stale_after:
-                    LOG.warning("串口读取曾暂停过久，丢弃积压数据并等待新 GGA")
+                    LOG.warning("Serial reader stalled; input buffer cleared")
                     self._discard_backlog()
                 self.poll()
                 last_poll = now
@@ -317,9 +318,13 @@ class GgaReader:
         except (OSError, serial.SerialException, SerialLinkError) as exc:
             with self._lock:
                 self.latest = None
-                self._error = SerialLinkError(f"接收机串口读取失败：{exc}")
+                self._error = (
+                    exc
+                    if isinstance(exc, SerialLinkError)
+                    else SerialLinkError(f"Serial read failed: {exc}")
+                )
 
-    def _record(self, gga: GgaData, now: float) -> bool:
+    def _record(self, gga: GgaData, now: float) -> None:
         # A repeated UTC epoch must not renew freshness, even if UART keeps sending it.
         backwards = False
         if gga.time_utc is not None:
@@ -356,12 +361,11 @@ class GgaReader:
             previous is None or previous.quality != gga.quality or was_usable != usable
         )
         if backwards:
-            LOG.warning("GGA UTC 回退，清除旧位置并等待下一定位历元")
-        if changed or now - self.last_status_report >= 5:
+            LOG.warning("GGA UTC moved backwards; position cleared")
+        if changed:
             self._log_position(gga)
             if gga.has_position and not usable:
-                LOG.warning("GGA 定位历元未推进或已过期，暂停使用该位置")
-            self.last_status_report = now
+                LOG.warning("GGA epoch is stale or unchanged; fix ignored")
         if self.on_gga is not None:
             try:
                 self.on_gga(gga)
@@ -371,9 +375,8 @@ class GgaReader:
                     self._last_callback_error is None
                     or now - self._last_callback_error >= 5
                 ):
-                    LOG.exception("发布 GNSS PVT 数据失败")
+                    LOG.exception("Failed to publish GNSS PVT")
                     self._last_callback_error = now
-        return usable
 
     def poll(self) -> None:
         available = getattr(self.serial_port, "in_waiting", 0)
@@ -401,10 +404,10 @@ class GgaReader:
                             self._last_auxiliary_callback_error is None
                             or now - self._last_auxiliary_callback_error >= 5
                         ):
-                            LOG.exception("处理接收机辅助 NMEA 数据失败")
+                            LOG.exception("Failed to process auxiliary NMEA sentence")
                             self._last_auxiliary_callback_error = now
                 continue
-            LOG.debug("忽略不支持的 NMEA 或校验/格式错误的串口报文：%r", line[:160])
+            LOG.debug("Ignored invalid or unsupported NMEA sentence: %r", line[:160])
 
         # Recover from garbage or incomplete oversized sentences on the UART.
         if len(self.buffer) > 8192:
@@ -414,25 +417,11 @@ class GgaReader:
                 self.buffer.clear()
 
     def _log_position(self, gga: GgaData) -> None:
-        LOG.debug("接收机原始 GGA：%s", gga.sentence.decode("ascii").strip())
+        LOG.debug("Raw GGA: %s", gga.sentence.decode("ascii").strip())
         if not gga.has_position:
-            LOG.warning(
-                "接收机 GGA：%s（quality=%d），卫星数=%s；无可用实测坐标，等待定位",
-                FIX_NAMES[gga.quality],
-                gga.quality,
-                gga.satellites if gga.satellites is not None else "未知",
-            )
+            LOG.warning("No valid GNSS fix (quality=%d)", gga.quality)
             return
-        LOG.info(
-            "接收机 GGA：%s；纬度=%.8f，经度=%.8f，卫星数=%s，HDOP=%s，海拔=%s m，UTC=%s",
-            FIX_NAMES[gga.quality],
-            gga.latitude,
-            gga.longitude,
-            gga.satellites,
-            gga.hdop,
-            gga.altitude_m,
-            gga.time_utc,
-        )
+        LOG.info("GNSS fix: %s (quality=%d)", FIX_NAMES[gga.quality], gga.quality)
 
     def get_latest(self) -> bytes | None:
         with self._lock:
@@ -454,8 +443,8 @@ class GgaReader:
             if self.get_latest() is not None:
                 return True
             now = time.monotonic()
-            if now - last_notice >= 5:
-                LOG.info("等待接收机的真实有效 GGA；单点定位即可请求 RTCM")
+            if now - last_notice >= 30:
+                LOG.info("Waiting for a valid GNSS fix")
                 last_notice = now
             self._stop.wait(0.1)
         return False
@@ -476,10 +465,12 @@ class Ros1PvtPublisher:
             import rospy
             from gnss_comm.msg import GnssPVTSolnMsg
         except ImportError as exc:
-            raise RuntimeError("需要先安装并加载 ROS 1、rospy 和 gnss_comm") from exc
+            raise RuntimeError("ROS 1, rospy, and gnss_comm are required") from exc
 
         self.GnssPVTSolnMsg = GnssPVTSolnMsg
         message = GnssPVTSolnMsg()
+        message_module = sys.modules.get(GnssPVTSolnMsg.__module__)
+        message_path = getattr(message_module, "__file__", "<unknown>")
         required_fields = (
             "time",
             "fix_type",
@@ -507,20 +498,16 @@ class Ros1PvtPublisher:
             hasattr(time_message, field) for field in ("week", "tow")
         )
         if missing_fields or missing_time_fields:
-            message_module = sys.modules.get(GnssPVTSolnMsg.__module__)
-            message_path = getattr(message_module, "__file__", "未知")
             actual_fields = ", ".join(getattr(message, "__slots__", ()))
             missing = list(missing_fields)
             if missing_time_fields:
                 missing.append("time.week/time.tow")
             raise RuntimeError(
-                "加载的 gnss_comm/GnssPVTSolnMsg 消息定义不兼容："
-                f"缺少字段 {', '.join(missing)}；消息文件：{message_path}；"
-                f"实际字段：{actual_fields}"
+                "Incompatible gnss_comm/GnssPVTSolnMsg: "
+                f"missing fields {', '.join(missing)} in {message_path} "
+                f"(available: {actual_fields})"
             )
 
-        message_module = sys.modules.get(GnssPVTSolnMsg.__module__)
-        message_path = getattr(message_module, "__file__", "未知")
         self.stop_event = threading.Event()
         rospy.init_node(
             "ntrip_gnss_relay",
@@ -528,20 +515,16 @@ class Ros1PvtPublisher:
         )
         self.pvt_publisher = rospy.Publisher(self.topic, GnssPVTSolnMsg, queue_size=10)
         LOG.info(
-            "ROS 1 PVT 发布器已就绪：%s [%s]；消息定义：%s",
+            "PVT publisher ready: %s [%s]",
             self.topic,
             getattr(GnssPVTSolnMsg, "_type", "gnss_comm/GnssPVTSolnMsg"),
-            message_path,
         )
-        self._latest_rmc: tuple[datetime, float, float, bool] | None = None
-        self._latest_rmc_received_at: float | None = None
-        self._latest_gsa: tuple[int, float] | None = None
-        self._latest_gsa_received_at: float | None = None
-        self._latest_gst: tuple[float, float] | None = None
-        self._latest_gst_received_at: float | None = None
+        LOG.debug("PVT message definition: %s", message_path)
+        self._latest_rmc: tuple[RmcData, float] | None = None
+        self._latest_gsa: tuple[GsaData, float] | None = None
+        self._latest_gst: tuple[GstData, float] | None = None
         self._pending_gga: tuple[GgaData, float] | None = None
         self._last_pvt_status = ""
-        self._last_pvt_status_at = 0.0
         rospy.on_shutdown(self.stop_event.set)
 
     def publish(self, gga: GgaData) -> None:
@@ -552,55 +535,44 @@ class Ros1PvtPublisher:
     def update_auxiliary(self, sentence: AuxiliaryNmea) -> None:
         now = time.monotonic()
         if isinstance(sentence, RmcData):
-            self._latest_rmc = (
-                sentence.timestamp,
-                sentence.speed_mps,
-                sentence.course_deg,
-                sentence.valid,
-            )
-            self._latest_rmc_received_at = now
+            self._latest_rmc = (sentence, now)
             pending = self._pending_gga
             if pending is not None and now - pending[1] <= RMC_MAX_AGE:
                 self._publish_pvt(pending[0], now)
                 self._pending_gga = None
         elif isinstance(sentence, GsaData):
-            self._latest_gsa = (sentence.mode, sentence.pdop)
-            self._latest_gsa_received_at = now
+            self._latest_gsa = (sentence, now)
         elif isinstance(sentence, GstData):
-            self._latest_gst = (sentence.h_acc, sentence.v_acc)
-            self._latest_gst_received_at = now
+            self._latest_gst = (sentence, now)
 
     def _publish_pvt(self, gga: GgaData, now: float) -> bool:
         if not gga.has_position:
-            self._log_pvt_status(now, "等待有效定位：GGA 尚无有效坐标")
             return False
         if gga.altitude_m is None or gga.geoid_separation_m is None:
             self._log_pvt_status(
-                now, "等待 PVT：GGA 缺少以米为单位的海拔或大地水准面差"
+                "PVT skipped: missing altitude or geoid separation in meters"
             )
             return False
-        if (
-            self._latest_rmc is None
-            or self._latest_rmc_received_at is None
-            or now - self._latest_rmc_received_at > RMC_MAX_AGE
-        ):
-            self._log_pvt_status(now, "等待 PVT：尚无 5 秒内的有效 RMC 日期和时间")
+        latest_rmc = self._latest_rmc
+        if latest_rmc is None or now - latest_rmc[1] > RMC_MAX_AGE:
+            self._log_pvt_status("PVT skipped: no recent valid RMC timestamp")
             return False
 
-        has_recent_gsa = self._has_recent_gsa(now)
-        if has_recent_gsa and self._latest_gsa[0] == 1:
-            self._log_pvt_status(now, "等待有效定位：最近的 GSA 报告无定位")
+        latest_gsa = self._latest_gsa
+        has_recent_gsa = latest_gsa is not None and now - latest_gsa[1] <= 5.0
+        if has_recent_gsa and latest_gsa[0].mode == 1:
+            self._log_pvt_status("PVT skipped: recent GSA reports no fix")
             return False
 
-        rmc_time, speed, course, rmc_valid = self._latest_rmc
+        rmc = latest_rmc[0]
         try:
             gga_time = utc_time.fromisoformat(gga.time_utc)
         except (TypeError, ValueError):
             return False
-        utc_timestamp = datetime.combine(rmc_time.date(), gga_time).replace(
+        utc_timestamp = datetime.combine(rmc.timestamp.date(), gga_time).replace(
             tzinfo=timezone.utc
         )
-        date_delta = (utc_timestamp - rmc_time).total_seconds()
+        date_delta = (utc_timestamp - rmc.timestamp).total_seconds()
         if date_delta > 43200:
             utc_timestamp -= timedelta(days=1)
         elif date_delta < -43200:
@@ -612,7 +584,7 @@ class Ros1PvtPublisher:
         msg = self.GnssPVTSolnMsg()
         msg.time.week = int(week)
         msg.time.tow = tow
-        msg.fix_type = 2 if has_recent_gsa and self._latest_gsa[0] == 2 else 3
+        msg.fix_type = 2 if has_recent_gsa and latest_gsa[0].mode == 2 else 3
         msg.valid_fix = True
         msg.diff_soln = gga.quality in (2, 4, 5)
         msg.carr_soln = {4: 2, 5: 1}.get(gga.quality, 0)
@@ -621,45 +593,29 @@ class Ros1PvtPublisher:
         msg.longitude = gga.longitude
         msg.altitude = gga.altitude_m + gga.geoid_separation_m
         msg.height_msl = gga.altitude_m
-        msg.p_dop = self._latest_gsa[1] if has_recent_gsa else 0.0
-        msg.h_acc, msg.v_acc = (
-            self._latest_gst if self._has_recent_gst(now) else (0.0, 0.0)
-        )
-        speed_mps = speed if rmc_valid else 0.0
-        course_rad = math.radians(course)
+        msg.p_dop = latest_gsa[0].pdop if has_recent_gsa else 0.0
+        latest_gst = self._latest_gst
+        if latest_gst is not None and now - latest_gst[1] <= 2.0:
+            msg.h_acc = latest_gst[0].h_acc
+            msg.v_acc = latest_gst[0].v_acc
+        else:
+            msg.h_acc = msg.v_acc = 0.0
+        speed_mps = rmc.speed_mps if rmc.valid else 0.0
+        course_rad = math.radians(rmc.course_deg)
         msg.vel_n = speed_mps * math.cos(course_rad)
         msg.vel_e = speed_mps * math.sin(course_rad)
         msg.vel_d = 0.0
         msg.vel_acc = 0.0
         self.pvt_publisher.publish(msg)
         self._log_pvt_status(
-            now,
-            f"PVT 已发布：{FIX_NAMES[gga.quality]}，"
-            f"纬度={gga.latitude:.8f}，经度={gga.longitude:.8f}，"
-            f"椭球高={msg.altitude:.3f} m，fix_type={msg.fix_type}，"
-            f"差分={msg.diff_soln}，载波状态={msg.carr_soln}",
+            f"PVT published: {FIX_NAMES[gga.quality]} (quality={gga.quality})",
         )
         return True
 
-    def _log_pvt_status(self, now: float, status: str) -> None:
-        if status != self._last_pvt_status or now - self._last_pvt_status_at >= 5.0:
+    def _log_pvt_status(self, status: str) -> None:
+        if status != self._last_pvt_status:
             LOG.info("%s", status)
             self._last_pvt_status = status
-            self._last_pvt_status_at = now
-
-    def _has_recent_gsa(self, now: float) -> bool:
-        return (
-            self._latest_gsa is not None
-            and self._latest_gsa_received_at is not None
-            and now - self._latest_gsa_received_at <= 5.0
-        )
-
-    def _has_recent_gst(self, now: float) -> bool:
-        return (
-            self._latest_gst is not None
-            and self._latest_gst_received_at is not None
-            and now - self._latest_gst_received_at <= 2.0
-        )
 
     def close(self) -> None:
         self.stop_event.set()
@@ -668,24 +624,26 @@ class Ros1PvtPublisher:
 
 def _check_ntrip_status(status: bytes) -> int | None:
     if status.startswith(b"SOURCETABLE"):
-        raise NtripConfigurationError("服务端返回源表，请检查挂载点名称")
+        raise NtripConfigurationError(
+            "Caster returned a source table; check the mountpoint"
+        )
     if status.startswith(b"ERROR - Bad MountPoint"):
-        raise NtripConfigurationError("挂载点不存在或不可用（Bad MountPoint）")
+        raise NtripConfigurationError("Mountpoint unavailable (Bad MountPoint)")
     match = re.match(rb"(?:HTTP/\d\.\d|ICY)\s+(\d{3})(?:\s|$)", status)
     if match is None:
         return None
     code = int(match.group(1))
     if code in (400, 401, 403, 404, 410):
         details = {
-            400: "请求配置不正确",
-            401: "账号或密码错误，也可能已过期",
-            403: "账号没有该服务的访问权限",
-            404: "挂载点不存在",
-            410: "挂载点已停用",
+            400: "invalid request",
+            401: "authentication failed or credentials expired",
+            403: "access denied",
+            404: "mountpoint not found",
+            410: "mountpoint disabled",
         }
-        raise NtripConfigurationError(f"NTRIP {code}：{details[code]}")
+        raise NtripConfigurationError(f"NTRIP {code}: {details[code]}")
     if code != 200:
-        raise RelayError(f"NTRIP 服务响应 {code}")
+        raise RelayError(f"NTRIP server returned {code}")
     return code
 
 
@@ -702,20 +660,20 @@ def _read_ntrip_response(
             code = _check_ntrip_status(status)
             if b"\r\n\r\n" in response:
                 if code != 200:
-                    raise RelayError("无法识别 NTRIP 响应状态")
+                    raise RelayError("Invalid NTRIP response")
                 return tuple(bytes(response).split(b"\r\n\r\n", 1))
             if len(response) >= limit:
-                raise RelayError("NTRIP 响应头超过限制")
+                raise RelayError("NTRIP response headers exceed size limit")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise RelayError("等待 NTRIP 响应头超时")
+                raise RelayError("NTRIP response timeout")
             sock.settimeout(remaining)
             try:
                 chunk = sock.recv(min(4096, limit - len(response)))
             except socket.timeout as exc:
-                raise RelayError("等待 NTRIP 响应头超时") from exc
+                raise RelayError("NTRIP response timeout") from exc
             if not chunk:
-                raise RelayError("NTRIP 服务在返回响应头前关闭了连接")
+                raise RelayError("NTRIP server closed connection before response headers")
             response.extend(chunk)
     finally:
         sock.settimeout(timeout)
@@ -724,7 +682,6 @@ def _read_ntrip_response(
 def connect_mount(
     host: str, port: int, mount: str, username: str, password: str, timeout: float
 ) -> tuple[socket.socket, bytes]:
-    LOG.info("正在连接 CORS/NTRIP：%s:%d/%s", host, port, mount)
     sock = socket.create_connection((host, port), timeout=timeout)
     sock.settimeout(timeout)
     token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
@@ -740,8 +697,6 @@ def connect_mount(
     try:
         sock.sendall(request)
         response, remainder = _read_ntrip_response(sock)
-        status = response.splitlines()[0].decode("ascii", errors="replace")
-        LOG.info("CORS/NTRIP 响应：%s", status)
         sock.settimeout(0.2)
         return sock, remainder
     except BaseException:
@@ -755,9 +710,9 @@ def write_all(serial_port, data: bytes) -> None:
         try:
             count = serial_port.write(data[offset:])
         except (OSError, serial.SerialException) as exc:
-            raise SerialLinkError(f"接收机串口写入失败：{exc}") from exc
+            raise SerialLinkError(f"Serial write failed: {exc}") from exc
         if not count:
-            raise SerialLinkError("接收机串口写入超时")
+            raise SerialLinkError("Serial write timeout")
         offset += count
 
 
@@ -782,16 +737,15 @@ def relay_session(
     with sock:
         gga = gga_reader.get_latest()
         if gga is None:
-            raise RelayError("接收机无有效实时位置，暂停转发并等待新定位")
+            raise RelayError("No fresh GNSS fix")
         sock.sendall(gga)
         last_gga_sent = time.monotonic()
         rtcm_wait_started_at = last_gga_sent
         last_report = last_gga_sent
         last_rtcm_at: float | None = None
         total_bytes = 0
-        recovered = False
         LOG.info(
-            "NTRIP 已连接：%s:%d/%s；等待 RTCM 数据",
+            "NTRIP connected: %s:%d/%s",
             args.host,
             args.caster_port,
             args.mount,
@@ -801,24 +755,23 @@ def relay_session(
             write_all(serial_port, pending)
             total_bytes += len(pending)
             last_rtcm_at = time.monotonic()
-            LOG.info("已收到并转发首批 RTCM：%d 字节", len(pending))
+            LOG.info("RTCM received: %d bytes", len(pending))
             if on_data:
                 on_data()
-            recovered = True
 
         while not gga_reader.should_stop():
             now = time.monotonic()
             gga = gga_reader.get_latest()
             if gga is None:
-                raise RelayError("接收机未定位或 GGA 已超时，暂停转发并等待新定位")
+                raise RelayError("GNSS fix expired")
             since = last_rtcm_at if last_rtcm_at is not None else rtcm_wait_started_at
             if now - since >= args.rtcm_timeout:
                 detail = (
-                    "一直未收到首包 RTCM"
+                    "No RTCM data received"
                     if last_rtcm_at is None
-                    else "RTCM 数据流已停止"
+                    else "RTCM stream stalled"
                 )
-                raise RelayError(f"{detail}，超过 {args.rtcm_timeout:g} 秒")
+                raise RelayError(f"{detail} for {args.rtcm_timeout:g}s")
             if now - last_gga_sent >= args.gga_interval:
                 sock.sendall(gga)
                 last_gga_sent = now
@@ -830,25 +783,26 @@ def relay_session(
                 data = b""
                 timed_out = True
             except OSError as exc:
-                raise RelayError(f"NTRIP 接收失败：{exc}") from exc
+                raise RelayError(f"NTRIP receive failed: {exc}") from exc
 
             if data:
                 if gga_reader.get_latest() is None:
-                    raise RelayError("接收机未定位或 GGA 已超时，暂停转发并等待新定位")
+                    raise RelayError("GNSS fix expired")
+                first_packet = last_rtcm_at is None
                 write_all(serial_port, data)
                 total_bytes += len(data)
                 last_rtcm_at = time.monotonic()
-                if not recovered:
-                    LOG.info("已收到并转发首批 RTCM：%d 字节", len(data))
+                if first_packet:
+                    LOG.info("RTCM received: %d bytes", len(data))
                     if on_data:
                         on_data()
-                    recovered = True
             elif not timed_out:
-                raise RelayError("NTRIP 服务端关闭了 RTCM 数据流")
+                raise RelayError("NTRIP server closed the RTCM stream")
 
             if now - last_report >= 10:
-                age = now - (gga_reader.updated_at or now)
-                LOG.info("已转发 %d 字节 RTCM；GGA 年龄 %.1f 秒", total_bytes, age)
+                updated_at = gga_reader.updated_at
+                age = now - updated_at if updated_at is not None else 0.0
+                LOG.debug("RTCM forwarded: %d bytes; GGA age %.1fs", total_bytes, age)
                 last_report = now
 
 
@@ -885,8 +839,7 @@ def run_relay(
                 rtscts=False,
                 dsrdtr=False,
             ) as serial_port:
-                LOG.info("串口已打开：%s @ %d baud", args.serial, args.baud)
-                LOG.info("NMEA 来源：接收机串口实时 GGA/GSA/GST/RMC 输出")
+                LOG.info("Serial open: %s @ %d baud", args.serial, args.baud)
                 with GgaReader(
                     serial_port,
                     args.gga_timeout,
@@ -908,14 +861,16 @@ def run_relay(
                             raise
                         except (OSError, RelayError) as exc:
                             delay = network_backoff.next_delay()
-                            LOG.warning("NTRIP 中断：%s；%.0f 秒后重试", exc, delay)
+                            LOG.warning("NTRIP failed: %s; retrying in %.0fs", exc, delay)
                             wait_backoff(delay)
         except NtripConfigurationError as exc:
-            LOG.error("%s；请修正配置后重新运行", exc)
+            LOG.error("%s", exc)
             return 2
         except (SerialLinkError, serial.SerialException, OSError) as exc:
             delay = serial_backoff.next_delay()
-            LOG.warning("串口故障：%s；%.0f 秒后重新打开 %s", exc, delay, args.serial)
+            LOG.warning(
+                "Serial error: %s; reopening %s in %.0fs", exc, args.serial, delay
+            )
             wait_backoff(delay)
     return 0
 
@@ -1013,7 +968,7 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
     configure_logging(args.verbose)
-    LOG.info("启动节点脚本：%s", Path(__file__).resolve())
+    LOG.debug("Relay script: %s", Path(__file__).resolve())
     if any(
         not math.isfinite(value) or value <= 0
         for value in (
@@ -1023,19 +978,19 @@ def main(argv=None) -> int:
             args.rtcm_timeout,
         )
     ):
-        LOG.error("时间参数必须为有限且大于 0 的数值")
+        LOG.error("Timeouts and intervals must be finite and greater than zero")
         return 2
 
     username = args.username or input("NTRIP 账号: ").strip()
     password = os.getenv("NTRIP_PASSWORD") or getpass.getpass("NTRIP 密码: ")
     if not username or not password:
-        LOG.error("NTRIP 账号和密码不能为空")
+        LOG.error("NTRIP username and password are required")
         return 2
 
     try:
         pvt_publisher = Ros1PvtPublisher(args.ros_args)
     except (ImportError, RuntimeError) as exc:
-        LOG.error("无法启动 ROS 1 GNSS 发布：%s", exc)
+        LOG.error("Failed to start ROS 1 GNSS publisher: %s", exc)
         return 2
 
     try:
@@ -1048,7 +1003,7 @@ def main(argv=None) -> int:
             shutdown_event=pvt_publisher.stop_event,
         )
     except KeyboardInterrupt:
-        LOG.info("已停止")
+        LOG.info("Stopped")
         return 0
     finally:
         pvt_publisher.close()

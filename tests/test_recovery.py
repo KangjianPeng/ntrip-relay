@@ -81,7 +81,7 @@ class NtripResponseTests(unittest.TestCase):
             (b"HTTP/1.1 403 Forbidden\r\n", "403"),
             (b"HTTP/1.1 404 Not Found", "404"),
             (b"ERROR - Bad MountPoint\r\n", "Bad MountPoint"),
-            (b"SOURCETABLE 200 OK\r\n", "源表"),
+            (b"SOURCETABLE 200 OK\r\n", "source table"),
         ]
         for raw, detail in cases:
             with self.subTest(raw=raw):
@@ -114,9 +114,9 @@ class NtripResponseTests(unittest.TestCase):
         self.assertNotIsInstance(error.exception, relay.NtripConfigurationError)
 
     def test_header_timeout_and_size_limit(self):
-        with self.assertRaisesRegex(relay.RelayError, "超时"):
+        with self.assertRaisesRegex(relay.RelayError, "timeout"):
             relay._read_ntrip_response(ResponseSocket([socket.timeout()]))
-        with self.assertRaisesRegex(relay.RelayError, "超过限制"):
+        with self.assertRaisesRegex(relay.RelayError, "size limit"):
             relay._read_ntrip_response(ResponseSocket([b"X" * 32]), limit=32)
 
 
@@ -152,14 +152,14 @@ class StreamTimeoutTests(unittest.TestCase):
 
     def test_no_first_packet_expires_despite_continued_gga_upload(self):
         error, port, calls, elapsed = self.exercise()
-        self.assertIn("首包", str(error))
+        self.assertIn("No RTCM data received", str(error))
         self.assertEqual(port.writes, b"")
         self.assertEqual(calls, [])
         self.assertEqual(elapsed, 4)
 
     def test_stalled_stream_expires_and_marks_previous_recovery(self):
         error, port, calls, elapsed = self.exercise(first_packet=True)
-        self.assertIn("已停止", str(error))
+        self.assertIn("RTCM stream stalled", str(error))
         self.assertEqual(port.writes, b"\xd3\x00\x00")
         self.assertEqual(calls, ["recovered"])
         self.assertEqual(elapsed, 5)
@@ -464,7 +464,7 @@ class LocalIntegrationTests(unittest.TestCase):
             ) as port:
                 with relay.GgaReader(port, stale_after=15) as reader:
                     feeder.start()
-                    with self.assertRaisesRegex(relay.RelayError, "已停止"):
+                    with self.assertRaisesRegex(relay.RelayError, "RTCM stream stalled"):
                         relay.relay_session(args, port, "test", "test", reader)
                     self.assertIsNotNone(reader.get_latest())
             ready, _, _ = select.select([master], [], [], 1)
